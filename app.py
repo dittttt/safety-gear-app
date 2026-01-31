@@ -17,6 +17,7 @@ class AppConfig:
     tracker_key: str = "botsort"
     rider_moto_ioa: float = 0.05
     gear_rider_ioa: float = 0.20
+    overlay_enabled: bool = True
 
 
 CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
@@ -184,6 +185,8 @@ def tracker_yaml_path(tracker_key: str) -> str:
 class VideoThread(QtCore.QThread):
     frameReady = QtCore.pyqtSignal(QtGui.QImage)
     statusReady = QtCore.pyqtSignal(str)
+    metaReady = QtCore.pyqtSignal(float, int)  # fps, total_frames
+    positionReady = QtCore.pyqtSignal(int)     # current_frame_index (0-based)
 
     def __init__(self) -> None:
         super().__init__()
@@ -195,6 +198,12 @@ class VideoThread(QtCore.QThread):
         self._paused = True
         self._restart_requested = False
         self._models: Dict[int, YOLO] = {}
+
+        self._video_fps: float = 0.0
+        self._total_frames: int = 0
+        self._seek_to_frame: Optional[int] = None
+        self._reset_tracker_next: bool = False
+        self._playback_rate: float = 1.0
 
         self._frame_delay_ms: int = 1
 
@@ -216,6 +225,30 @@ class VideoThread(QtCore.QThread):
     def set_tracker(self, tracker_key: str) -> None:
         self._config.tracker_key = tracker_key
         self._restart_requested = True
+
+    def set_overlay_enabled(self, enabled: bool) -> None:
+        self._config.overlay_enabled = bool(enabled)
+        # Reload/clear models depending on new overlay state.
+        self._restart_requested = True
+
+    def request_seek(self, frame_index: int) -> None:
+        try:
+            idx = int(frame_index)
+        except Exception:
+            return
+        if idx < 0:
+            idx = 0
+        self._seek_to_frame = idx
+
+    def set_playback_rate(self, rate: float) -> None:
+        try:
+            r = float(rate)
+        except Exception:
+            return
+        if r <= 0:
+            return
+        # Clamp to a reasonable range.
+        self._playback_rate = max(0.1, min(8.0, r))
 
     def set_rider_moto_ioa(self, value: float) -> None:
         self._config.rider_moto_ioa = max(0.0, min(1.0, float(value)))
@@ -243,11 +276,18 @@ class VideoThread(QtCore.QThread):
         self.statusReady.emit(text)
 
     def _load_model(self) -> None:
+        if not self._config.overlay_enabled:
+            self._models.clear()
+            return
+
         rider_path = self._model_paths.get(1)
         if not rider_path:
-            raise RuntimeError("No Rider model selected (class 1)")
+            # Preview-only mode (no overlay). Still allow playback + seeking.
+            self._models.clear()
+            self._emit_status("Overlay disabled (set Rider model to enable tracking)")
+            return
 
-        # Load selected models; Rider (class 1) is required for tracking.
+        # Load selected models; Rider (class 1) drives tracking.
         self._models.clear()
         for class_id, path in self._model_paths.items():
             if not path:
@@ -258,7 +298,6 @@ class VideoThread(QtCore.QThread):
             self._models[class_id] = YOLO(path)
 
         if 1 not in self._models:
-            # Should not happen, but keep the error explicit.
             raise RuntimeError("Failed to load Rider model")
 
     def _collect_dets(
@@ -390,10 +429,9 @@ class VideoThread(QtCore.QThread):
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps and fps > 0:
-            self._frame_delay_ms = int(1000 / fps)
-        else:
-            self._frame_delay_ms = 1
+        self._video_fps = float(fps) if fps and fps > 0 else 0.0
+        self._total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.metaReady.emit(self._video_fps, self._total_frames)
 
         try:
             self._load_model()
@@ -402,13 +440,40 @@ class VideoThread(QtCore.QThread):
             cap.release()
             return
 
-        self._emit_status("Ready (press Play)")
+        if 1 in self._models:
+            self._emit_status("Ready (press Play) | overlay enabled")
+        else:
+            self._emit_status("Ready (press Play) | overlay disabled")
 
         last_time = time.time()
         frame_count = 0
 
         while not self._stop:
-            if self._paused:
+            force_one_frame = False
+
+            # Apply seek requests even while paused, then render one frame so the UI updates.
+            if self._seek_to_frame is not None:
+                idx = self._seek_to_frame
+                self._seek_to_frame = None
+                if idx < 0:
+                    idx = 0
+                if self._total_frames > 0:
+                    idx = min(idx, self._total_frames - 1)
+
+                # Some codecs/backends are unreliable with frame-based seeking; fall back to time-based.
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                pos_after = cap.get(cv2.CAP_PROP_POS_FRAMES)
+                if (not pos_after) and self._video_fps and self._video_fps > 0:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, (idx / self._video_fps) * 1000.0)
+                elif pos_after and abs(float(pos_after) - float(idx)) > 2.0 and self._video_fps and self._video_fps > 0:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, (idx / self._video_fps) * 1000.0)
+
+                # Seeking breaks temporal continuity; reset tracking state on next frame.
+                self._reset_tracker_next = True
+                self._emit_status(f"Seek: frame {idx}")
+                force_one_frame = True
+
+            if self._paused and not force_one_frame:
                 self.msleep(25)
                 continue
 
@@ -424,49 +489,67 @@ class VideoThread(QtCore.QThread):
                     continue
                 self._emit_status("Restarted video due to configuration change")
 
+                self._reset_tracker_next = True
+
+            frame_start = time.time()
             ok, frame = cap.read()
             if not ok:
                 self._emit_status("End of video")
                 self._paused = True
                 continue
 
-            tracker_path = tracker_yaml_path(self._config.tracker_key)
-            if self._config.tracker_key == "strongsort" and not os.path.exists(tracker_path):
-                tracker_path = tracker_yaml_path("bytetrack")
+            # Update current frame position (0-based) for UI.
+            try:
+                pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                if pos < 0:
+                    pos = 0
+                self.positionReady.emit(pos)
+            except Exception:
+                pass
 
             try:
-                # 1) Rider model drives tracking.
-                rider_model = self._models[1]
-                track_results = rider_model.track(
-                    frame,
-                    conf=self._config.conf,
-                    iou=self._config.iou,
-                    persist=True,
-                    tracker=tracker_path,
-                    verbose=False,
-                )
+                if not self._config.overlay_enabled or 1 not in self._models:
+                    # Preview-only mode.
+                    annotated = frame
+                else:
+                    tracker_path = tracker_yaml_path(self._config.tracker_key)
+                    if self._config.tracker_key == "strongsort" and not os.path.exists(tracker_path):
+                        tracker_path = tracker_yaml_path("bytetrack")
 
-                track_result0 = track_results[0] if isinstance(track_results, (list, tuple)) else track_results
-                dets = self._collect_dets(track_result0, class_id_override=1, include_track_ids=True)
-
-                # 2) Other single-class models run detection (no tracking IDs).
-                for class_id in TARGET_CLASS_IDS:
-                    if class_id == 1:
-                        continue
-                    model = self._models.get(class_id)
-                    if model is None:
-                        continue
-                    pred_results = model.predict(
+                    # 1) Rider model drives tracking.
+                    rider_model = self._models[1]
+                    track_results = rider_model.track(
                         frame,
                         conf=self._config.conf,
                         iou=self._config.iou,
+                        persist=(not self._reset_tracker_next),
+                        tracker=tracker_path,
                         verbose=False,
                     )
-                    pred0 = pred_results[0] if isinstance(pred_results, (list, tuple)) else pred_results
-                    dets.extend(self._collect_dets(pred0, class_id_override=class_id, include_track_ids=False))
 
-                dets = self._filter_dets_by_overlap(dets)
-                annotated = self._annotate(frame, dets)
+                    self._reset_tracker_next = False
+
+                    track_result0 = track_results[0] if isinstance(track_results, (list, tuple)) else track_results
+                    dets = self._collect_dets(track_result0, class_id_override=1, include_track_ids=True)
+
+                    # 2) Other single-class models run detection (no tracking IDs).
+                    for class_id in TARGET_CLASS_IDS:
+                        if class_id == 1:
+                            continue
+                        model = self._models.get(class_id)
+                        if model is None:
+                            continue
+                        pred_results = model.predict(
+                            frame,
+                            conf=self._config.conf,
+                            iou=self._config.iou,
+                            verbose=False,
+                        )
+                        pred0 = pred_results[0] if isinstance(pred_results, (list, tuple)) else pred_results
+                        dets.extend(self._collect_dets(pred0, class_id_override=class_id, include_track_ids=False))
+
+                    dets = self._filter_dets_by_overlap(dets)
+                    annotated = self._annotate(frame, dets)
             except Exception as e:
                 self._emit_status(f"Inference error: {e}")
                 self._paused = True
@@ -488,8 +571,26 @@ class VideoThread(QtCore.QThread):
                 last_time = now
                 frame_count = 0
 
-            if self._frame_delay_ms > 1:
-                self.msleep(max(1, self._frame_delay_ms // 2))
+            # Playback rate control.
+            fps_eff = self._video_fps if self._video_fps > 0 else 0.0
+            if fps_eff > 0:
+                target_ms = 1000.0 / (fps_eff * max(0.1, self._playback_rate))
+            else:
+                target_ms = 0.0
+
+            elapsed_ms = (time.time() - frame_start) * 1000.0
+            sleep_ms = int(max(0.0, target_ms - elapsed_ms))
+            if sleep_ms > 0:
+                self.msleep(min(250, sleep_ms))
+
+            # Speed-up by skipping frames for common >1x rates.
+            if self._playback_rate >= 2.0:
+                skip = int(self._playback_rate) - 1
+                for _ in range(skip):
+                    if self._stop or self._paused:
+                        break
+                    if not cap.grab():
+                        break
 
         cap.release()
         self._emit_status("Stopped")
@@ -513,6 +614,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread = VideoThread()
         self._thread.frameReady.connect(self._on_frame)
         self._thread.statusReady.connect(self._set_status)
+        self._thread.metaReady.connect(self._on_video_meta)
+        self._thread.positionReady.connect(self._on_video_position)
+
+        self._video_fps: float = 0.0
+        self._total_frames: int = 0
+        self._user_seeking: bool = False
 
         for cid, bgr in self._class_colors_bgr.items():
             self._thread.set_class_color_bgr(cid, bgr)
@@ -634,6 +741,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnPause = QtWidgets.QPushButton("Pause")
         self.btnStop = QtWidgets.QPushButton("Stop")
 
+        self.overlayToggle = QtWidgets.QCheckBox("Overlay")
+        self.overlayToggle.setChecked(True)
+
+        self.positionSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.positionSlider.setRange(0, 0)
+        self.positionSlider.setEnabled(False)
+        self.positionSlider.setTracking(False)
+
+        self.timeCurrent = QtWidgets.QLabel("0:00")
+        self.timeTotal = QtWidgets.QLabel("0:00")
+
+        self.speedCombo = QtWidgets.QComboBox()
+        self.speedCombo.addItem("0.25x", 0.25)
+        self.speedCombo.addItem("0.5x", 0.5)
+        self.speedCombo.addItem("1x", 1.0)
+        self.speedCombo.addItem("2x", 2.0)
+        self.speedCombo.addItem("4x", 4.0)
+        self.speedCombo.setCurrentIndex(2)
+
         self.trackerCombo = QtWidgets.QComboBox()
         self.trackerCombo.addItem("BoT-SORT (primary)", "botsort")
         self.trackerCombo.addItem("StrongSORT (if available)", "strongsort")
@@ -698,13 +824,22 @@ class MainWindow(QtWidgets.QMainWindow):
         btnRow.addWidget(self.btnPlay)
         btnRow.addWidget(self.btnPause)
         btnRow.addWidget(self.btnStop)
+        btnRow.addWidget(self.overlayToggle)
+        btnRow.addStretch(1)
+        btnRow.addWidget(QtWidgets.QLabel("Speed"))
+        btnRow.addWidget(self.speedCombo)
 
         self.statusBar = QtWidgets.QLabel("Idle")
 
         layout = QtWidgets.QVBoxLayout(central)
         layout.addLayout(grid)
-        layout.addLayout(btnRow)
         layout.addWidget(self.videoLabel, stretch=1)
+        seekRow = QtWidgets.QHBoxLayout()
+        seekRow.addWidget(self.timeCurrent)
+        seekRow.addWidget(self.positionSlider, stretch=1)
+        seekRow.addWidget(self.timeTotal)
+        layout.addLayout(seekRow)
+        layout.addLayout(btnRow)
         layout.addWidget(self.statusBar)
 
         self.btnLoadVideo.clicked.connect(self._pick_video)
@@ -724,6 +859,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnPlay.clicked.connect(self._play)
         self.btnPause.clicked.connect(self._pause)
         self.btnStop.clicked.connect(self._stop)
+
+        self.positionSlider.sliderPressed.connect(self._on_seek_pressed)
+        self.positionSlider.sliderReleased.connect(self._on_seek_released)
+        self.positionSlider.sliderMoved.connect(self._on_seek_moved)
+        self.speedCombo.currentIndexChanged.connect(self._on_speed_changed)
+        self.overlayToggle.toggled.connect(self._on_overlay_toggled)
 
         self.confSlider.valueChanged.connect(self._on_conf_changed)
         self.iouSlider.valueChanged.connect(self._on_iou_changed)
@@ -765,6 +906,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         ok, frame = cap.read()
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         cap.release()
         if not ok or frame is None:
             QtWidgets.QMessageBox.critical(
@@ -781,6 +924,109 @@ class MainWindow(QtWidgets.QMainWindow):
         h, w, ch = rgb.shape
         qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
         self._on_frame(qimg)
+
+        # Initialize seek UI from preview metadata.
+        self._video_fps = float(fps) if fps and fps > 0 else 0.0
+        self._total_frames = int(total or 0)
+        self._init_seek_ui()
+
+    def _format_time(self, seconds: float) -> str:
+        if seconds is None or seconds < 0:
+            seconds = 0.0
+        total = int(seconds + 0.5)
+        m = total // 60
+        s = total % 60
+        return f"{m}:{s:02d}"
+
+    def _init_seek_ui(self) -> None:
+        if self._total_frames and self._total_frames > 1:
+            self.positionSlider.setEnabled(True)
+            self.positionSlider.setRange(0, self._total_frames - 1)
+        else:
+            self.positionSlider.setEnabled(False)
+            self.positionSlider.setRange(0, 0)
+
+        if self._video_fps and self._video_fps > 0 and self._total_frames and self._total_frames > 0:
+            total_seconds = (self._total_frames - 1) / self._video_fps
+            self.timeTotal.setText(self._format_time(total_seconds))
+        else:
+            self.timeTotal.setText("0:00")
+
+    def _on_video_meta(self, fps: float, total_frames: int) -> None:
+        # Thread metadata (may differ slightly from preview).
+        if fps and fps > 0:
+            self._video_fps = float(fps)
+        if total_frames and total_frames > 0:
+            self._total_frames = int(total_frames)
+        self._init_seek_ui()
+
+    def _on_video_position(self, frame_index: int) -> None:
+        if self._user_seeking:
+            return
+        if self._total_frames and self._total_frames > 0:
+            frame_index = max(0, min(int(frame_index), self._total_frames - 1))
+        else:
+            frame_index = max(0, int(frame_index))
+
+        self.positionSlider.blockSignals(True)
+        self.positionSlider.setValue(frame_index)
+        self.positionSlider.blockSignals(False)
+
+        if self._video_fps and self._video_fps > 0:
+            self.timeCurrent.setText(self._format_time(frame_index / self._video_fps))
+
+    def _on_seek_pressed(self) -> None:
+        self._user_seeking = True
+
+    def _on_seek_released(self) -> None:
+        self._user_seeking = False
+        target = int(self.positionSlider.value())
+        if self._thread.isRunning():
+            self._thread.request_seek(target)
+        else:
+            self._seek_preview_frame(target)
+
+    def _on_seek_moved(self, value: int) -> None:
+        # Update the time label while dragging.
+        if self._video_fps and self._video_fps > 0:
+            self.timeCurrent.setText(self._format_time(int(value) / self._video_fps))
+
+    def _seek_preview_frame(self, frame_index: int) -> None:
+        if not self._video_path:
+            return
+        if not self._total_frames or self._total_frames <= 0:
+            return
+        idx = int(frame_index)
+        idx = max(0, min(idx, self._total_frames - 1))
+
+        cap = cv2.VideoCapture(self._video_path)
+        if not cap.isOpened():
+            return
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            return
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
+        self._on_frame(qimg)
+        self._on_video_position(idx)
+        self._set_status(f"Preview seek: frame {idx}")
+
+    def _on_speed_changed(self) -> None:
+        rate = self.speedCombo.currentData()
+        if rate is None:
+            return
+        self._thread.set_playback_rate(float(rate))
+
+    def _on_overlay_toggled(self, checked: bool) -> None:
+        self._thread.set_overlay_enabled(bool(checked))
+        if checked:
+            self._set_status("Overlay enabled")
+        else:
+            self._set_status("Overlay disabled")
 
     def _normalize_name(self, path: str) -> str:
         base = os.path.basename(path)
@@ -888,12 +1134,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._video_path:
             self._set_status("Select a video first")
             return
-        if not self._model_paths.get(1):
-            self._set_status("Select the Rider model (required) to enable tracking")
-            return
         self._ensure_thread_started()
         self._thread.play()
-        self._set_status("Playing")
+        if self.overlayToggle.isChecked() and self._model_paths.get(1):
+            self._set_status("Playing (overlay enabled)")
+        elif self.overlayToggle.isChecked() and not self._model_paths.get(1):
+            self._set_status("Playing (overlay enabled but Rider model not set)")
+        else:
+            self._set_status("Playing (overlay disabled)")
 
     def _pause(self) -> None:
         self._thread.pause()
