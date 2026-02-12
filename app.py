@@ -62,6 +62,18 @@ def _ioa(child: Tuple[int, int, int, int], parent: Tuple[int, int, int, int]) ->
     return inter / float(area_child)
 
 
+def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    area_a = _box_area(a)
+    area_b = _box_area(b)
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+    inter = _intersection_area(a, b)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / float(union)
+
+
 class DropLabel(QtWidgets.QLabel):
     """QLabel that accepts drag-and-drop file paths."""
 
@@ -447,9 +459,23 @@ class VideoThread(QtCore.QThread):
 
         last_time = time.time()
         frame_count = 0
+        frame_idx = 0
+        last_counts_time = time.time()
+        last_counts_write_time = time.time()
+
+        # Unique object counting (per class) with persistence filter.
+        PERSISTENCE_FRAMES = 8
+        unique_ids_by_class = {cid: set() for cid in TARGET_CLASS_IDS}
+        seen_frames_by_class = {cid: {} for cid in TARGET_CLASS_IDS}
+        # Rider counting via lightweight IOU tracklets (more robust than ID reuse).
+        IOU_MATCH_THRESH = 0.7
+        MAX_MISSES = 60
+        rider_tracklets = {}
+        next_rider_tid = 1
 
         while not self._stop:
             force_one_frame = False
+            dets_for_count = []
 
             # Apply seek requests even while paused, then render one frame so the UI updates.
             if self._seek_to_frame is not None:
@@ -508,6 +534,7 @@ class VideoThread(QtCore.QThread):
                 pass
 
             try:
+                dets = []
                 if not self._config.overlay_enabled or 1 not in self._models:
                     # Preview-only mode.
                     annotated = frame
@@ -548,12 +575,52 @@ class VideoThread(QtCore.QThread):
                         pred0 = pred_results[0] if isinstance(pred_results, (list, tuple)) else pred_results
                         dets.extend(self._collect_dets(pred0, class_id_override=class_id, include_track_ids=False))
 
+                    dets_for_count = list(dets)
                     dets = self._filter_dets_by_overlap(dets)
                     annotated = self._annotate(frame, dets)
             except Exception as e:
                 self._emit_status(f"Inference error: {e}")
                 self._paused = True
                 continue
+
+            # Update unique counts (track IDs only).
+            for (x1, y1, x2, y2, class_id, _, track_id) in dets_for_count:
+                if class_id != 1:
+                    continue
+
+                box = (int(x1), int(y1), int(x2), int(y2))
+                best_tid = None
+                best_iou = 0.0
+                for tid, t in rider_tracklets.items():
+                    if frame_idx - t["last_seen"] > MAX_MISSES:
+                        continue
+                    iou = _iou(box, t["bbox"])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_tid = tid
+
+                if best_tid is not None and best_iou >= IOU_MATCH_THRESH:
+                    t = rider_tracklets[best_tid]
+                    t["bbox"] = box
+                    t["last_seen"] = frame_idx
+                    t["seen"] += 1
+                    if t["seen"] >= PERSISTENCE_FRAMES:
+                        unique_ids_by_class[class_id].add(best_tid)
+                else:
+                    tid = next_rider_tid
+                    next_rider_tid += 1
+                    rider_tracklets[tid] = {
+                        "bbox": box,
+                        "last_seen": frame_idx,
+                        "seen": 1,
+                    }
+
+            # Cleanup stale rider tracklets occasionally.
+            if frame_idx % 60 == 0:
+                stale = [tid for tid, t in rider_tracklets.items() if frame_idx - t["last_seen"] > MAX_MISSES]
+                for tid in stale:
+                    del rider_tracklets[tid]
+
 
             rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
@@ -562,6 +629,7 @@ class VideoThread(QtCore.QThread):
             self.frameReady.emit(qimg)
 
             frame_count += 1
+            frame_idx += 1
             now = time.time()
             if now - last_time >= 1.0:
                 self._emit_status(
@@ -570,6 +638,19 @@ class VideoThread(QtCore.QThread):
                 )
                 last_time = now
                 frame_count = 0
+
+            if time.time() - last_counts_time >= 1.0:
+                last_counts_time = time.time()
+
+            if time.time() - last_counts_write_time >= 1.0:
+                try:
+                    with open("unique_counts.txt", "w", encoding="utf-8") as f:
+                        f.write("Unique object counts (live):\n")
+                        for c in TARGET_CLASS_IDS:
+                            f.write(f"{CLASS_NAMES_DEFAULT.get(c, str(c))}: {len(unique_ids_by_class[c])}\n")
+                except Exception as e:
+                    print(f"Failed to write unique_counts.txt: {e}")
+                last_counts_write_time = time.time()
 
             # Playback rate control.
             fps_eff = self._video_fps if self._video_fps > 0 else 0.0
@@ -593,6 +674,18 @@ class VideoThread(QtCore.QThread):
                         break
 
         cap.release()
+        # Final report saved to text file.
+        try:
+            with open("unique_counts.txt", "w", encoding="utf-8") as f:
+                f.write("Unique object counts:\n")
+                for c in TARGET_CLASS_IDS:
+                    f.write(f"{CLASS_NAMES_DEFAULT.get(c, str(c))}: {len(unique_ids_by_class[c])}\n")
+        except Exception as e:
+            print(f"Failed to write unique_counts.txt: {e}")
+
+        print("Unique object counts:")
+        for c in TARGET_CLASS_IDS:
+            print(f"{CLASS_NAMES_DEFAULT.get(c, str(c))}: {len(unique_ids_by_class[c])}")
         self._emit_status("Stopped")
 
 
