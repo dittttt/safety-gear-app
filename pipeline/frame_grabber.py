@@ -59,6 +59,7 @@ class FrameGrabberThread(QtCore.QThread):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, seek_target)
                 frame_idx = seek_target
                 state.reset_tracker_flag = True
+                next_frame_time = time.perf_counter()
 
                 if state.pause_event.is_set():
                     ok, frame = cap.read()
@@ -114,14 +115,13 @@ class FrameGrabberThread(QtCore.QThread):
 
             # ── Playback pacing ────────────────────────────────────────────
             rate = state.get_playback_rate()
-            effective_rate = rate * 1.03 if rate <= 1.0 else rate
-            frame_period = (1.0 / (fps * effective_rate)) if fps > 0 and effective_rate > 0 else 0.0
+            frame_period = (1.0 / (fps * rate)) if fps > 0 and rate > 0 else 0.0
             if frame_period > 0.0:
                 next_frame_time += frame_period
                 now = time.perf_counter()
                 if next_frame_time < now - (frame_period * 2.0):
                     next_frame_time = now
-                sleep_s = max(0.0, next_frame_time - now - 0.0020)
+                sleep_s = max(0.0, next_frame_time - now)
             else:
                 sleep_s = 0.0
 

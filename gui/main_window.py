@@ -7,6 +7,7 @@ from __future__ import annotations
 import os, queue, tempfile
 from typing import Dict, Optional
 import cv2, numpy as np, qtawesome as qta
+import torch
 from PyQt5 import QtCore, QtGui, QtWidgets
 from config import (TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS,
                     MODEL_EXTENSIONS, DEFAULT_MODEL_FILES)
@@ -590,7 +591,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sr.setContentsMargins(0, 0, 0, 0)
         self.strideSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.strideSlider.setRange(1, 16)
-        self.strideSlider.setValue(6)
+        self.strideSlider.setValue(3)
         self.strideSlider.setMinimumHeight(int(18 * _S))
         self.strideSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.strideLabel = QtWidgets.QLabel("1")
@@ -801,10 +802,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if os.path.isfile(p):
                 self._set_model(cid, p)
                 loaded.append(CLASS_NAMES[cid])
-        self._state.set_imgsz(256)
-        self._state.set_device("auto")
-        self._state.set_use_fp16(False)
-        self._state.set_inference_stride(6)
+        use_cuda = torch.cuda.is_available()
+        default_imgsz = 320 if use_cuda else 256
+        default_stride = 3 if use_cuda else 6
+        self._state.set_imgsz(default_imgsz)
+        self._state.set_device("cuda" if use_cuda else "auto")
+        self._state.set_use_fp16(use_cuda)
+        self._state.set_inference_stride(default_stride)
+
+        self.imgszCombo.setCurrentText(str(default_imgsz))
+        self.strideSlider.setValue(default_stride)
+        self.strideLabel.setText(str(default_stride))
+        self.deviceCombo.setCurrentIndex(1 if use_cuda else 0)
+        self.chkFp16.setChecked(use_cuda)
         self._set_status(
             f"Auto-loaded: {', '.join(loaded)}" if loaded
             else "No default models found \u2014 load via sidebar")
