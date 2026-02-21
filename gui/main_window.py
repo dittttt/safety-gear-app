@@ -27,6 +27,23 @@ def _fa(name, color=_T, sz=18):
     return qta.icon(f"fa5s.{name}", color=color)
 
 _S = 1.5  # fixed UI scale – no dynamic rescaling
+_DROP_PROMPT = "Drop a video here or use the sidebar to load one"
+_FS_ICON_SIZE = int(16 * _S)
+_STAT_ITEMS = (
+    ("motorcycles", "Motos"),
+    ("riders", "Riders"),
+    ("no_helmet", "No Helmet"),
+    ("overloaded_motos", "Overload"),
+    ("invalid_detections", "Occluded"),
+)
+_CLASS_INFER_RULES = (
+    (4, ("improper", "no footwear", "barefoot")),
+    (3, ("footwear", "shoe", "boot")),
+    (2, ("helmet", "hardhat")),
+    (0, ("motorcycle", "motorbike", "moto")),
+    (1, ("rider", "driver", "person")),
+)
+_CLASS_INFER_TRANSLATE = str.maketrans("-_.", "   ")
 
 
 def _qss(s: float, chk: str) -> str:
@@ -43,32 +60,32 @@ def _qss(s: float, chk: str) -> str:
         f"#sidebar QLabel{{color:{_T};}}"
         f"#sidebarTitle{{font-size:{px(13)};font-weight:600;color:{_TH};"
         f"padding:{px(6)} 0 {px(10)} 0;letter-spacing:0.5px;}}"
-        f"#sectionLabel{{font-size:{px(11)};font-weight:600;color:{_TD};"
-        f"text-transform:uppercase;letter-spacing:1px;"
-        f"padding:{px(8)} 0 {px(4)} 0;}}"
-        f"#modelCard{{background:#141414;border:1px solid {_BD};"
-        f"border-radius:{px(5)};padding:{px(4)} 0;}}"
-        f"#modelFileBox{{background:#111;border-radius:{px(3)};"
-        f"border-left:3px solid #333;}}"
+        f"#sectionLabel{{font-size:{px(10)};font-weight:600;color:{_TD};"
+        f"text-transform:uppercase;letter-spacing:1.2px;"
+        f"padding:{px(14)} 0 {px(4)} 0;}}"
+        f"#modelCard{{background:transparent;border:none;"
+        f"border-radius:0;padding:{px(2)} 0;margin:0;}}"
+        f"#modelFileBox{{background:transparent;border-radius:0;"
+        f"border-left:2px solid #333;}}"
         f"#modelFileBox *{{background:transparent;}}"
         f"#modelFileIcon{{background:transparent;border:none;min-width:0;"
-        f"padding:0 {px(4)} 0 {px(2)};}}"
-        f"#modelFileIcon:hover{{background:rgba(255,255,255,0.08);"
+        f"padding:0;margin:0;}}"
+        f"#modelFileIcon:hover{{background:rgba(255,255,255,0.06);"
         f"border-radius:{px(2)};}}"
-        f"#modelFile{{color:{_TD};font-size:{px(10)};"
+        f"#modelFile{{color:{_TD};font-size:{px(11)};"
         f"padding:{px(2)} {px(6)};background:transparent;}}"
-        f"#modelFileLoaded{{color:{_TH};font-size:{px(10)};"
+        f"#modelFileLoaded{{color:{_TH};font-size:{px(11)};"
         f"padding:{px(2)} {px(6)};background:transparent;}}"
-        f"#videoFileRow{{background:#181818;border:1px solid {_BD};"
-        f"border-radius:{px(4)};}}"
+        f"#videoFileRow{{background:transparent;border:none;"
+        f"border-radius:0;}}"
         f"#videoFileRow *{{background:transparent;}}"
-        f"#videoFileRow:hover{{background:#1e1e1e;}}"
-        f"QPushButton{{background:#181818;color:{_T};border:1px solid {_BD};"
+        f"#videoFileRow:hover{{background:rgba(255,255,255,0.04);}}"
+        f"QPushButton{{background:{_BG};color:{_T};border:1px solid {_BD};"
         f"border-radius:{px(4)};padding:{px(5)} {px(12)};"
         f"font-size:{px(11)};}}"
-        f"QPushButton:hover{{background:#222;}}"
-        f"QPushButton:pressed{{background:#333;}}"
-        f"QPushButton:disabled{{background:#111;color:#333;}}"
+        f"QPushButton:hover{{background:#1a1a1a;}}"
+        f"QPushButton:pressed{{background:#222;}}"
+        f"QPushButton:disabled{{background:{_BG};color:#333;border-color:#151515;}}"
         f"QPushButton:focus{{outline:none;}}"
         f"#iconBtn{{background:transparent;border:none;"
         f"border-radius:{px(4)};padding:0;"
@@ -77,7 +94,7 @@ def _qss(s: float, chk: str) -> str:
         f"#iconBtn:pressed{{background:{_PRS};}}"
         f"#iconBtn:focus{{outline:none;background:transparent;}}"
         f"#closeVideoBtn{{background:transparent;border:none;"
-        f"padding:0 {px(4)};min-width:{px(20)};}}"
+        f"padding:0;margin:0;min-width:0;}}"
         f"#closeVideoBtn:hover{{background:rgba(255,255,255,0.08);"
         f"border-radius:{px(3)};}}"
         # seek slider – groove only; circle drawn by SeekSlider.paintEvent
@@ -94,8 +111,10 @@ def _qss(s: float, chk: str) -> str:
         # sidebar sliders
         f"QSlider::groove:horizontal{{height:{px(3)};background:#2a2a2a;"
         f"border-radius:{px(1)};}}"
-        f"QSlider::handle:horizontal{{background:{_TH};width:{px(10)};"
-        f"height:{px(10)};margin:-{px(4)} 0;border-radius:{px(5)};}}"
+        f"QSlider::handle:horizontal{{background:{_TH};border:none;"
+        f"width:{px(10)};height:{px(10)};margin:-{px(4)} 0;"
+        f"border-radius:{px(5)};}}"
+        f"QSlider::handle:horizontal:hover{{background:{_W};}}"
         f"QSlider::sub-page:horizontal{{background:{_T};"
         f"border-radius:{px(1)};}}"
         f"QCheckBox{{spacing:{px(6)};color:{_T};font-size:{px(11)};}}"
@@ -111,14 +130,20 @@ def _qss(s: float, chk: str) -> str:
         f"#timeLabel{{color:rgba(255,255,255,0.6);font-size:{px(11)};"
         f"font-family:'Consolas','Courier New',monospace;"
         f"padding:0;margin:0;background:transparent;}}"
-        f"#speedBtn{{color:rgba(255,255,255,0.7);font-size:{px(11)};"
-        f"font-weight:500;background:transparent;border:none;"
-        f"padding:0;outline:none;min-width:0;min-height:0;}}"
-        f"#speedBtn:hover{{background:{_HOV};border-radius:{px(3)};}}"
-        f"#speedBtn:focus{{outline:none;background:transparent;}}"
+
         f"#vidName{{color:{_T};font-size:{px(11)};padding:0;"
         f"background:transparent;}}"
-        f"#sliderLabel{{color:{_TD};font-size:{px(10)};}}"
+        f"#sliderLabel{{color:{_TD};font-size:{px(11)};}}"
+        f"QComboBox{{background:transparent;color:{_T};"
+        f"border:1px solid #1a1a1a;border-radius:{px(3)};"
+        f"padding:{px(4)} {px(8)};font-size:{px(11)};"
+        f"min-height:{px(20)};}}"
+        f"QComboBox:hover{{border-color:#333;}}"
+        f"QComboBox::drop-down{{border:none;width:{px(20)};}}"
+        f"QComboBox::down-arrow{{image:none;}}"
+        f"QComboBox QAbstractItemView{{background:#141414;color:{_T};"
+        f"border:1px solid {_BD};selection-background-color:#222;"
+        f"font-size:{px(11)};}}"
         f"#statusLabel{{color:#444;font-size:{px(10)};"
         f"padding:{px(1)} {px(8)};}}"
         f"QScrollArea{{border:none;background:transparent;}}"
@@ -153,7 +178,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._user_seeking = self._is_playing = False
         self._last_pixmap = QtGui.QPixmap()
         self._preview_cap: Optional[cv2.VideoCapture] = None
-        self._prev_frame_idx = -999
         # fullscreen state
         self._is_fs = False
         self._fs_hide = QtCore.QTimer(self)
@@ -213,10 +237,10 @@ class MainWindow(QtWidgets.QMainWindow):
         loaded = lbl.objectName() == "modelFileLoaded"
         fg = _TH if loaded else _TD
         box.setStyleSheet(
-            f"QWidget#modelFileBox{{background:#111;border-radius:{int(3*_S)}px;"
-            f"border-left:3px solid {qcol.name()};}}")
+            f"QWidget#modelFileBox{{background:transparent;border-radius:0;"
+            f"border-left:2px solid {qcol.name()};}}")
         lbl.setStyleSheet(
-            f"QLabel{{color:{fg};font-size:{int(10*_S)}px;"
+            f"QLabel{{color:{fg};font-size:{int(11*_S)}px;"
             f"padding:{int(2*_S)}px {int(6*_S)}px;"
             "background:transparent;}")
 
@@ -264,7 +288,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cl = QtWidgets.QVBoxLayout(self._vc)
         cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(0)
         self.videoDisplay = VideoDropLabel(
-            "Drop a video here or use the sidebar to load one")
+            _DROP_PROMPT)
         self.videoDisplay.setObjectName("videoDisplay")
         self.videoDisplay.setMinimumSize(320, 180)
         self.videoDisplay.setScaledContents(False)
@@ -342,14 +366,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._speeds = [("0.25×", .25), ("0.5×", .5), ("1×", 1.),
                         ("1.5×", 1.5), ("2×", 2.), ("4×", 4.)]
         self._spd_idx = 2
-        self.btnSpeed = QtWidgets.QPushButton("1×")
-        self.btnSpeed.setObjectName("speedBtn")
-        self.btnSpeed.setToolTip("Playback speed")
-        self.btnSpeed.setFixedWidth(int(30 * _S))
-        self.btnSpeed.setCursor(
-            QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.btnSpeed.setFocusPolicy(QtCore.Qt.NoFocus)
-        self.btnSpeed.setFlat(True)
+        self.btnSpeed = self._ibtn("tachometer-alt", "Playback speed")
 
         for w in (self.btnPlay, self.btnStepFwd, self._btnVol, self.btnSpeed):
             cr.addWidget(w, 0, AV)
@@ -441,6 +458,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lblVidName.setObjectName("vidName")
         self.lblVidName.setWordWrap(False)
         vfr.addWidget(self.lblVidName, stretch=1)
+        _sq = int(24 * _S)  # square button size
         csz = int(11 * _S)
         self.btnCloseVid = QtWidgets.QPushButton()
         self.btnCloseVid.setIcon(_fa("times", _TD, csz))
@@ -448,8 +466,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnCloseVid.setObjectName("closeVideoBtn")
         self.btnCloseVid.setToolTip("Close video")
         self.btnCloseVid.setFlat(True)
-        self.btnCloseVid.setFixedSize(int(22*_S), int(22*_S))
+        self.btnCloseVid.setFixedSize(_sq, _sq)
         self.btnCloseVid.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnCloseVid.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         vfr.addWidget(self.btnCloseVid)
         self._vfWidget.setFixedHeight(int(28 * _S))
         self._vfWidget.setVisible(False)
@@ -464,8 +483,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mfile_box: Dict[int, QtWidgets.QWidget] = {}
         mcard = QtWidgets.QWidget(); mcard.setObjectName("modelCard")
         ml = QtWidgets.QVBoxLayout(mcard)
-        ml.setContentsMargins(
-            int(8*_S), int(6*_S), int(8*_S), int(6*_S))
+        ml.setContentsMargins(0, int(4*_S), 0, int(4*_S))
         ml.setSpacing(int(5 * _S))
         bisz = int(11 * _S)
         for cid in TARGET_CLASS_IDS:
@@ -493,11 +511,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mstat[cid] = st
             fr.addWidget(st, stretch=1)
 
+            _msq = int(22 * _S)  # square 1:1
             btn = QtWidgets.QPushButton()
             btn.setObjectName("modelFileIcon")
             btn.setIcon(_fa("folder-open", _TD, bisz))
             btn.setIconSize(QtCore.QSize(bisz, bisz))
-            btn.setFixedSize(int(24 * _S), int(22 * _S))
+            btn.setFixedSize(_msq, _msq)
             btn.setToolTip(f"Load {name} model")
             btn.setFlat(True)
             btn.setFocusPolicy(QtCore.Qt.NoFocus)
@@ -513,25 +532,74 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # DETECTION
         lay.addWidget(self._section("DETECTION"))
+        dcard = QtWidgets.QWidget(); dcard.setObjectName("modelCard")
+        dl = QtWidgets.QVBoxLayout(dcard)
+        dl.setContentsMargins(0, int(4*_S), 0, int(4*_S))
+        dl.setSpacing(int(5 * _S))
+
         self.chkOverlay = QtWidgets.QCheckBox("Show overlays")
         self.chkOverlay.setChecked(True)
-        lay.addWidget(self.chkOverlay)
-        lay.addSpacing(int(4 * _S))
+        dl.addWidget(self.chkOverlay)
+
         for attr, label, default in [("conf", "Confidence", 25),
                                      ("iou", "IoU", 45)]:
             lbl = QtWidgets.QLabel(label)
             lbl.setObjectName("sliderLabel")
-            lay.addWidget(lbl)
+            dl.addWidget(lbl)
             r = QtWidgets.QHBoxLayout(); r.setSpacing(int(6 * _S))
+            r.setContentsMargins(0, 0, 0, 0)
             slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
             slider.setRange(0, 100); slider.setValue(default)
+            slider.setMinimumHeight(int(18 * _S))
+            slider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             val = QtWidgets.QLabel(f"{default / 100:.2f}")
             val.setObjectName("sliderLabel")
             val.setFixedWidth(int(32 * _S))
             r.addWidget(slider, stretch=1); r.addWidget(val)
-            lay.addLayout(r)
+            dl.addLayout(r)
             setattr(self, f"{attr}Slider", slider)
             setattr(self, f"{attr}Label", val)
+
+        perf_lbl = QtWidgets.QLabel("Inference Size")
+        perf_lbl.setObjectName("sliderLabel")
+        dl.addWidget(perf_lbl)
+        self.imgszCombo = QtWidgets.QComboBox()
+        for size in (320, 480, 640, 960, 1280):
+            self.imgszCombo.addItem(str(size), size)
+        self.imgszCombo.setCurrentText("640")
+        dl.addWidget(self.imgszCombo)
+
+        dev_lbl = QtWidgets.QLabel("Device")
+        dev_lbl.setObjectName("sliderLabel")
+        dl.addWidget(dev_lbl)
+        self.deviceCombo = QtWidgets.QComboBox()
+        self.deviceCombo.addItem("Auto", "auto")
+        self.deviceCombo.addItem("GPU (CUDA)", "cuda")
+        self.deviceCombo.addItem("CPU", "cpu")
+        dl.addWidget(self.deviceCombo)
+
+        self.chkFp16 = QtWidgets.QCheckBox("Use FP16 (GPU only)")
+        self.chkFp16.setChecked(False)
+        dl.addWidget(self.chkFp16)
+
+        stride_lbl = QtWidgets.QLabel("Inference Stride")
+        stride_lbl.setObjectName("sliderLabel")
+        dl.addWidget(stride_lbl)
+        sr = QtWidgets.QHBoxLayout(); sr.setSpacing(int(6 * _S))
+        sr.setContentsMargins(0, 0, 0, 0)
+        self.strideSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.strideSlider.setRange(1, 4)
+        self.strideSlider.setValue(1)
+        self.strideSlider.setMinimumHeight(int(18 * _S))
+        self.strideSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.strideLabel = QtWidgets.QLabel("1")
+        self.strideLabel.setObjectName("sliderLabel")
+        self.strideLabel.setFixedWidth(int(20 * _S))
+        sr.addWidget(self.strideSlider, stretch=1)
+        sr.addWidget(self.strideLabel)
+        dl.addLayout(sr)
+
+        lay.addWidget(dcard)
         lay.addStretch()
         scroll.setWidget(content); outer.addWidget(scroll)
         return sb
@@ -606,6 +674,15 @@ class MainWindow(QtWidgets.QMainWindow):
         _bind("F", self._toggle_fullscreen)
         _bind("Escape", lambda: self._is_fs and self._exit_fullscreen())
 
+    def _set_fs_button(self, icon: str, tooltip: str) -> None:
+        self.btnFS.setIcon(_fa(icon, _W, _FS_ICON_SIZE))
+        self.btnFS.setIconSize(QtCore.QSize(_FS_ICON_SIZE, _FS_ICON_SIZE))
+        self.btnFS.setToolTip(tooltip)
+
+    def _set_video_ui_state(self, loaded: bool) -> None:
+        self.btnLoadVideo.setVisible(not loaded)
+        self._vfWidget.setVisible(loaded)
+
     # ── fullscreen ────────────────────────────────────────────────────────
 
     def _toggle_fullscreen(self) -> None:
@@ -619,10 +696,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.hide()
         self._topBar.hide()
         self.statusLabel.hide()
-        isz = int(16 * _S)
-        self.btnFS.setIcon(_fa("compress", _W, isz))
-        self.btnFS.setIconSize(QtCore.QSize(isz, isz))
-        self.btnFS.setToolTip("Exit Fullscreen")
+        self._set_fs_button("compress", "Exit Fullscreen")
         self.showFullScreen()
         self._overlay.show()
         self._fs_hide.start(3000)
@@ -634,10 +708,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.show()
         self._topBar.show()
         self.statusLabel.show()
-        isz = int(16 * _S)
-        self.btnFS.setIcon(_fa("expand", _W, isz))
-        self.btnFS.setIconSize(QtCore.QSize(isz, isz))
-        self.btnFS.setToolTip("Fullscreen")
+        self._set_fs_button("expand", "Fullscreen")
         self._overlay.show()
         self.videoDisplay.setCursor(QtCore.Qt.ArrowCursor)
         self.showNormal()
@@ -679,9 +750,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda _=False, c=cid: self._on_load_model(c))
         self.videoDisplay.filesDropped.connect(self._on_files_dropped)
         self.btnPlay.clicked.connect(self._on_play_pause)
-        self.btnStepFwd.clicked.connect(
-            lambda: self._state.video_path and self._skip(
-                1 / max(self._video_fps, 1)))
+        self.btnStepFwd.clicked.connect(self._step_forward)
         self.btnRew.clicked.connect(lambda: self._skip(-10))
         self.btnFwd.clicked.connect(lambda: self._skip(10))
         self.btnShot.clicked.connect(self._take_screenshot)
@@ -701,6 +770,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 if ev.button() == QtCore.Qt.LeftButton else None)
         self.confSlider.valueChanged.connect(self._on_conf)
         self.iouSlider.valueChanged.connect(self._on_iou)
+        self.imgszCombo.currentIndexChanged.connect(self._on_imgsz_changed)
+        self.deviceCombo.currentIndexChanged.connect(self._on_device_changed)
+        self.chkFp16.toggled.connect(self._on_fp16_toggled)
+        self.strideSlider.valueChanged.connect(self._on_stride_changed)
 
     def _on_pick_model_color(self, cid: int) -> None:
         current = self._to_qcolor_bgr(self._state.get_class_color(cid))
@@ -714,6 +787,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._state.set_class_color(cid, self._to_bgr_tuple(picked))
         self._set_model_color_btn_style(cid)
 
+    def _step_forward(self) -> None:
+        if self._state.video_path:
+            self._skip(1 / max(self._video_fps, 1))
+
     # ── auto-load models ──────────────────────────────────────────────────
 
     def _auto_load_models(self) -> None:
@@ -723,6 +800,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if os.path.isfile(p):
                 self._set_model(cid, p)
                 loaded.append(CLASS_NAMES[cid])
+        self._state.set_imgsz(640)
+        self._state.set_device("auto")
+        self._state.set_use_fp16(False)
+        self._state.set_inference_stride(1)
         self._set_status(
             f"Auto-loaded: {', '.join(loaded)}" if loaded
             else "No default models found \u2014 load via sidebar")
@@ -780,13 +861,8 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _infer_class(path: str) -> Optional[int]:
         n = os.path.splitext(os.path.basename(path))[0].lower()
-        for ch in "-_.":
-            n = n.replace(ch, " ")
-        for cid, keys in [(4, ["improper", "no footwear", "barefoot"]),
-                          (3, ["footwear", "shoe", "boot"]),
-                          (2, ["helmet", "hardhat"]),
-                          (0, ["motorcycle", "motorbike", "moto"]),
-                          (1, ["rider", "driver", "person"])]:
+        n = n.translate(_CLASS_INFER_TRANSLATE)
+        for cid, keys in _CLASS_INFER_RULES:
             if any(k in n for k in keys):
                 return cid
         return None
@@ -806,7 +882,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._preview_cap is not None:
             self._preview_cap.release()
         self._preview_cap = cv2.VideoCapture(path)
-        self._prev_frame_idx = -999
         if ok and frame is not None:
             self._show_frame(frame)
         self._state.video_path = path
@@ -814,8 +889,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_seek()
         bn = os.path.basename(path)
         self.lblVidName.setText(bn); self.lblVidName.setToolTip(path)
-        self.btnLoadVideo.setVisible(False)
-        self._vfWidget.setVisible(True)
+        self._set_video_ui_state(True)
         self._set_status(
             f"Loaded: {bn}  \u00b7  "
             f"{self._fmt(total / fps if fps else 0)} @ {fps:.1f} FPS")
@@ -855,11 +929,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lblTime.setText("0:00"); self.lblTotal.setText("0:00")
         self._last_pixmap = QtGui.QPixmap()
         self.videoDisplay.setPixmap(QtGui.QPixmap())
-        self.videoDisplay.setText(
-            "Drop a video here or use the sidebar to load one")
+        self.videoDisplay.setText(_DROP_PROMPT)
         self.lblVidName.setText(""); self.lblVidName.setToolTip("")
-        self._vfWidget.setVisible(False)
-        self.btnLoadVideo.setVisible(True)
+        self._set_video_ui_state(False)
         self._set_status("Ready")
 
     def _ensure_pipeline(self) -> None:
@@ -921,31 +993,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._seekPrev.move(px, py)
         self._seekPrev.show(); self._seekPrev.raise_()
 
-    def _grab_thumbnail(self, idx: int) -> Optional[np.ndarray]:
-        """Grab a frame for the seek preview, suppressing h264 warnings."""
-        if self._preview_cap is None:
-            return None
-        self._preview_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        # redirect stderr to suppress ffmpeg h264 reference warnings
-        fd = os.open(os.devnull, os.O_WRONLY)
-        old = os.dup(2)
-        os.dup2(fd, 2)
-        ok, f = self._preview_cap.read()
-        os.dup2(old, 2)
-        os.close(old); os.close(fd)
-        return f if ok else None
-
     # ── display ───────────────────────────────────────────────────────────
 
     def _poll_display(self) -> None:
-        latest = None
+        packet = None
         while True:
             try:
-                latest = self._state.display_queue.get_nowait()
+                packet = self._state.display_queue.get_nowait()
             except queue.Empty:
                 break
-        if latest is not None:
-            self._show_frame(latest.annotated_frame)
+        if packet is not None:
+            self._show_frame(packet.annotated_frame)
 
     def _show_frame(self, bgr: np.ndarray) -> None:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -979,10 +1037,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_stats(self, s: dict) -> None:
         parts = [f"FPS {self._current_fps:.0f}"]
-        for k, lbl in [("motorcycles", "Motos"), ("riders", "Riders"),
-                        ("no_helmet", "No Helmet"),
-                        ("overloaded_motos", "Overload"),
-                        ("invalid_detections", "Occluded")]:
+        for k, lbl in _STAT_ITEMS:
             if s.get(k):
                 parts.append(f"{lbl} {s[k]}")
         self._set_status("  \u00b7  ".join(parts))
@@ -999,6 +1054,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_iou(self, v: int) -> None:
         self.iouLabel.setText(f"{v / 100:.2f}")
         self._state.set_iou(v / 100)
+
+    def _on_imgsz_changed(self) -> None:
+        size = int(self.imgszCombo.currentData() or 640)
+        self._state.set_imgsz(size)
+        self._set_status(f"Inference size set to {size} (takes effect on next start)")
+
+    def _on_device_changed(self) -> None:
+        device = str(self.deviceCombo.currentData() or "auto")
+        self._state.set_device(device)
+        self._set_status(f"Device set to {device.upper()} (takes effect on next start)")
+
+    def _on_fp16_toggled(self, enabled: bool) -> None:
+        self._state.set_use_fp16(bool(enabled))
+        self._set_status("FP16 enabled (GPU only, takes effect on next start)"
+                         if enabled else "FP16 disabled")
+
+    def _on_stride_changed(self, v: int) -> None:
+        self.strideLabel.setText(str(v))
+        self._state.set_inference_stride(v)
+        self._set_status(f"Inference stride set to {v}x")
 
     def _show_speed_menu(self) -> None:
         menu = QtWidgets.QMenu(self)
@@ -1019,7 +1094,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if chosen:
             i, r = chosen.data()
             self._spd_idx = i
-            self.btnSpeed.setText(self._speeds[i][0])
             self._state.set_playback_rate(float(r))
 
     # ── helpers ───────────────────────────────────────────────────────────

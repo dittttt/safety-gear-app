@@ -56,6 +56,10 @@ class DetectionConfig:
     """Mutable detection settings shared across threads."""
     conf: float = 0.25
     iou: float = 0.45
+    imgsz: int = 640
+    inference_stride: int = 1
+    use_fp16: bool = False
+    device: str = "auto"
     rider_moto_ioa_thresh: float = 0.05
     gear_rider_ioa_thresh: float = 0.20
     occlusion_conf_thresh: float = 0.15

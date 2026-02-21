@@ -154,6 +154,41 @@ class PipelineState:
         with self._lock:
             self.detection_config.iou = max(0.0, min(1.0, float(val)))
 
+    def get_imgsz(self) -> int:
+        with self._lock:
+            return int(self.detection_config.imgsz)
+
+    def set_imgsz(self, val: int) -> None:
+        with self._lock:
+            size = int(val)
+            self.detection_config.imgsz = max(320, min(1280, size))
+
+    def get_inference_stride(self) -> int:
+        with self._lock:
+            return max(1, int(self.detection_config.inference_stride))
+
+    def set_inference_stride(self, val: int) -> None:
+        with self._lock:
+            self.detection_config.inference_stride = max(1, min(8, int(val)))
+
+    def use_fp16(self) -> bool:
+        with self._lock:
+            return bool(self.detection_config.use_fp16)
+
+    def set_use_fp16(self, enabled: bool) -> None:
+        with self._lock:
+            self.detection_config.use_fp16 = bool(enabled)
+
+    def get_device(self) -> str:
+        with self._lock:
+            dev = str(self.detection_config.device or "auto").strip().lower()
+            return dev if dev in {"auto", "cpu", "cuda"} else "auto"
+
+    def set_device(self, device: str) -> None:
+        with self._lock:
+            dev = str(device or "auto").strip().lower()
+            self.detection_config.device = dev if dev in {"auto", "cpu", "cuda"} else "auto"
+
     def is_model_enabled(self, class_id: int) -> bool:
         with self._lock:
             return self.enabled_models.get(class_id, False)

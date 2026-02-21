@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from PyQt5 import QtCore
 from ultralytics import YOLO
+import torch
 
 from config import TARGET_CLASS_IDS, CLASS_NAMES
 from pipeline.state import PipelineState, Detection, DetectionPacket
@@ -31,12 +32,24 @@ class InferenceThread(QtCore.QThread):
         super().__init__(parent)
         self._state = state
         self._models: Dict[int, YOLO] = {}
+        self._device: str = "cpu"
+        self._fp16: bool = False
+
+    def _resolve_device(self) -> str:
+        device = self._state.get_device()
+        if device == "cpu":
+            return "cpu"
+        if device == "cuda":
+            return "cuda:0" if torch.cuda.is_available() else "cpu"
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
 
     # ── Model management ───────────────────────────────────────────────────────
 
     def _load_models(self) -> None:
         """(Re)load models from current ``state.model_paths``."""
         self._models.clear()
+        self._device = self._resolve_device()
+        self._fp16 = self._state.use_fp16() and self._device.startswith("cuda")
         for cid in TARGET_CLASS_IDS:
             path = self._state.model_paths.get(cid)
             if not path or not os.path.isfile(path):
@@ -44,9 +57,15 @@ class InferenceThread(QtCore.QThread):
             name = CLASS_NAMES.get(cid, str(cid))
             self.status.emit(f"Loading {name}: {os.path.basename(path)}")
             try:
-                self._models[cid] = YOLO(path)
+                model = YOLO(path)
+                model.to(self._device)
+                self._models[cid] = model
             except Exception as exc:
                 self.status.emit(f"Failed to load {name}: {exc}")
+        self.status.emit(
+            f"Inference backend: {self._device}"
+            f"{' + FP16' if self._fp16 else ''}"
+        )
 
     # ── Detection extraction helpers ───────────────────────────────────────────
 
@@ -109,6 +128,8 @@ class InferenceThread(QtCore.QThread):
         persist_tracking = False
         frame_count = 0
         t0 = time.perf_counter()
+        step = 0
+        cached_dets: List[Detection] = []
 
         while not state.stop_event.is_set():
             # Pull next frame (with short timeout so we can still check stop).
@@ -128,11 +149,13 @@ class InferenceThread(QtCore.QThread):
             frame = packet.frame
             conf = state.get_conf()
             iou = state.get_iou()
+            imgsz = state.get_imgsz()
+            stride = state.get_inference_stride()
             overlay = state.is_overlay_enabled()
 
-            all_dets: List[Detection] = []
+            all_dets: List[Detection] = cached_dets if (stride > 1 and step % stride != 0) else []
 
-            if overlay and self._models:
+            if overlay and self._models and not (stride > 1 and step % stride != 0):
                 # ── 1) Rider model drives BoT-SORT tracking ────────────────
                 if 1 in self._models and state.is_model_enabled(1):
                     try:
@@ -140,6 +163,9 @@ class InferenceThread(QtCore.QThread):
                             frame,
                             conf=conf,
                             iou=iou,
+                            imgsz=imgsz,
+                            half=self._fp16,
+                            device=self._device,
                             persist=persist_tracking,
                             tracker=tracker_yaml,
                             verbose=False,
@@ -160,7 +186,13 @@ class InferenceThread(QtCore.QThread):
                         continue
                     try:
                         results = self._models[cid].predict(
-                            frame, conf=conf, iou=iou, verbose=False,
+                            frame,
+                            conf=conf,
+                            iou=iou,
+                            imgsz=imgsz,
+                            half=self._fp16,
+                            device=self._device,
+                            verbose=False,
                         )
                         r0 = results[0] if isinstance(results, (list, tuple)) else results
                         all_dets.extend(self._extract_detections(r0, class_id=cid))
@@ -169,6 +201,7 @@ class InferenceThread(QtCore.QThread):
                             f"Inference error ({CLASS_NAMES.get(cid, cid)}): {exc}"
                         )
 
+            cached_dets = all_dets
             det_packet = DetectionPacket(
                 index=packet.index,
                 frame=frame,
@@ -195,3 +228,4 @@ class InferenceThread(QtCore.QThread):
                 self.fps_update.emit(frame_count / (now - t0))
                 frame_count = 0
                 t0 = now
+            step += 1
