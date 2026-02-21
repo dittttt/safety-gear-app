@@ -171,12 +171,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._grabber: Optional[FrameGrabberThread] = None
         self._inferencer: Optional[InferenceThread] = None
         self._tracker: Optional[TrackerLogicThread] = None
-        self._timer = QtCore.QTimer(self, interval=8)
+        self._timer = QtCore.QTimer(self, interval=16)
         self._timer.timeout.connect(self._poll_display)
         self._video_fps = self._current_fps = 0.0
         self._total_frames = 0
         self._user_seeking = self._is_playing = False
         self._last_pixmap = QtGui.QPixmap()
+        self._last_rgb_frame: Optional[np.ndarray] = None
         self._preview_cap: Optional[cv2.VideoCapture] = None
         # fullscreen state
         self._is_fs = False
@@ -564,9 +565,9 @@ class MainWindow(QtWidgets.QMainWindow):
         perf_lbl.setObjectName("sliderLabel")
         dl.addWidget(perf_lbl)
         self.imgszCombo = QtWidgets.QComboBox()
-        for size in (320, 480, 640, 960, 1280):
+        for size in (256, 320, 480, 640, 960, 1280):
             self.imgszCombo.addItem(str(size), size)
-        self.imgszCombo.setCurrentText("640")
+        self.imgszCombo.setCurrentText("256")
         dl.addWidget(self.imgszCombo)
 
         dev_lbl = QtWidgets.QLabel("Device")
@@ -588,8 +589,8 @@ class MainWindow(QtWidgets.QMainWindow):
         sr = QtWidgets.QHBoxLayout(); sr.setSpacing(int(6 * _S))
         sr.setContentsMargins(0, 0, 0, 0)
         self.strideSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.strideSlider.setRange(1, 4)
-        self.strideSlider.setValue(1)
+        self.strideSlider.setRange(1, 16)
+        self.strideSlider.setValue(6)
         self.strideSlider.setMinimumHeight(int(18 * _S))
         self.strideSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.strideLabel = QtWidgets.QLabel("1")
@@ -623,7 +624,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self._last_pixmap.isNull():
                 self.videoDisplay.setPixmap(self._last_pixmap.scaled(
                     self.videoDisplay.size(), QtCore.Qt.IgnoreAspectRatio,
-                    QtCore.Qt.SmoothTransformation))
+                    QtCore.Qt.FastTransformation))
         # fullscreen: mouse movement on video/overlay → show controls
         if self._is_fs and etype == QtCore.QEvent.MouseMove:
             if obj in (self._vc, self.videoDisplay, self._overlay):
@@ -800,10 +801,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if os.path.isfile(p):
                 self._set_model(cid, p)
                 loaded.append(CLASS_NAMES[cid])
-        self._state.set_imgsz(640)
+        self._state.set_imgsz(256)
         self._state.set_device("auto")
         self._state.set_use_fp16(False)
-        self._state.set_inference_stride(1)
+        self._state.set_inference_stride(6)
         self._set_status(
             f"Auto-loaded: {', '.join(loaded)}" if loaded
             else "No default models found \u2014 load via sidebar")
@@ -1006,14 +1007,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_frame(packet.annotated_frame)
 
     def _show_frame(self, bgr: np.ndarray) -> None:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        self._last_rgb_frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = self._last_rgb_frame
         h, w, c = rgb.shape
         self._last_pixmap = QtGui.QPixmap.fromImage(
             QtGui.QImage(rgb.data, w, h, c * w,
-                         QtGui.QImage.Format_RGB888).copy())
+                         QtGui.QImage.Format_RGB888))
         self.videoDisplay.setPixmap(self._last_pixmap.scaled(
             self.videoDisplay.size(), QtCore.Qt.IgnoreAspectRatio,
-            QtCore.Qt.SmoothTransformation))
+            QtCore.Qt.FastTransformation))
 
     # ── callbacks ─────────────────────────────────────────────────────────
 

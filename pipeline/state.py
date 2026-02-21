@@ -53,6 +53,7 @@ class DetectionPacket:
     frame: np.ndarray
     detections: List[Detection] = field(default_factory=list)
     timestamp_ms: float = 0.0
+    detections_fresh: bool = True
 
 
 @dataclass
@@ -161,7 +162,7 @@ class PipelineState:
     def set_imgsz(self, val: int) -> None:
         with self._lock:
             size = int(val)
-            self.detection_config.imgsz = max(320, min(1280, size))
+            self.detection_config.imgsz = max(160, min(1280, size))
 
     def get_inference_stride(self) -> int:
         with self._lock:
@@ -169,7 +170,7 @@ class PipelineState:
 
     def set_inference_stride(self, val: int) -> None:
         with self._lock:
-            self.detection_config.inference_stride = max(1, min(8, int(val)))
+            self.detection_config.inference_stride = max(1, min(16, int(val)))
 
     def use_fp16(self) -> bool:
         with self._lock:

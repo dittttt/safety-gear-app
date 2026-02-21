@@ -7,6 +7,7 @@ and produces annotated ``DisplayPacket`` frames for the GUI.
 """
 
 from typing import Dict, List, Optional, Set, Tuple
+import queue
 
 import cv2
 import numpy as np
@@ -67,6 +68,19 @@ class TrackerLogicThread(QtCore.QThread):
 
     def run(self) -> None:  # noqa: C901
         state = self._state
+        last_stats = {
+            "motorcycles": 0,
+            "riders": 0,
+            "helmets": 0,
+            "footwear": 0,
+            "improper_footwear": 0,
+            "no_helmet": 0,
+            "footwear_compliant": 0,
+            "overloaded_motos": 0,
+            "overload_riders": 0,
+            "compliant_riders": 0,
+            "invalid_detections": 0,
+        }
 
         while not state.stop_event.is_set():
             try:
@@ -81,6 +95,45 @@ class TrackerLogicThread(QtCore.QThread):
             dets = packet.detections
             cfg = state.detection_config
             occlusion_thresh = cfg.occlusion_conf_thresh
+
+            if state.is_overlay_enabled() and not packet.detections_fresh:
+                annotated = frame
+                class_colors = state.get_class_colors()
+                for d in dets:
+                    color = class_colors.get(
+                        d.class_id,
+                        CLASS_COLORS_BGR.get(d.class_id, (255, 255, 255)),
+                    )
+                    cv2.rectangle(annotated, (d.x1, d.y1), (d.x2, d.y2), color, 2)
+                    label = CLASS_NAMES.get(d.class_id, "?")
+                    if d.class_id == CLASS_RIDER and d.track_id is not None:
+                        label = f"{label} ID:{d.track_id}"
+                    _draw_label(
+                        annotated,
+                        f"{label} {d.confidence:.2f}",
+                        d.x1,
+                        d.y1,
+                        color,
+                    )
+                disp = DisplayPacket(
+                    index=packet.index,
+                    annotated_frame=annotated,
+                    raw_frame=frame,
+                    stats=last_stats,
+                    timestamp_ms=packet.timestamp_ms,
+                )
+                try:
+                    state.display_queue.put_nowait(disp)
+                except queue.Full:
+                    try:
+                        state.display_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        state.display_queue.put_nowait(disp)
+                    except queue.Full:
+                        pass
+                continue
 
             # ── Separate by class ──────────────────────────────────────────
             motorcycles = [d for d in dets if d.class_id == CLASS_MOTORCYCLE and d.confidence >= occlusion_thresh]
@@ -150,6 +203,11 @@ class TrackerLogicThread(QtCore.QThread):
             total_riders = len(matched_riders)
             helmeted = sum(1 for g in rider_gear.values() if g["helmet"])
             fw_ok = sum(1 for g in rider_gear.values() if g["footwear_ok"] and not g["improper_fw"])
+            overloaded_rider_ids = {
+                id(r)
+                for mi in overloaded_motos
+                for r in moto_rider_map[mi]
+            }
 
             stats = {
                 "motorcycles": len(motorcycles),
@@ -164,9 +222,10 @@ class TrackerLogicThread(QtCore.QThread):
                 "compliant_riders": helmeted,
                 "invalid_detections": len(invalid),
             }
+            last_stats = stats
 
             # ── Annotate frame ────────────────────────────────────────────
-            annotated = frame.copy()
+            annotated = frame
             class_colors = state.get_class_colors()
 
             if state.is_overlay_enabled():
@@ -200,7 +259,7 @@ class TrackerLogicThread(QtCore.QThread):
                         issues.append("NO FOOTWEAR")
 
                     # Check if on overloaded motorcycle
-                    on_overloaded = any(rider in moto_rider_map[mi] for mi in overloaded_motos)
+                    on_overloaded = id(rider) in overloaded_rider_ids
 
                     if on_overloaded:
                         color = COLOR_OVERLOAD_BGR
@@ -244,16 +303,17 @@ class TrackerLogicThread(QtCore.QThread):
                 timestamp_ms=packet.timestamp_ms,
             )
 
-            placed = False
-            while not placed and not state.stop_event.is_set():
+            try:
+                state.display_queue.put_nowait(disp)
+            except queue.Full:
                 try:
-                    state.display_queue.put(disp, timeout=0.05)
-                    placed = True
-                except Exception:
-                    try:
-                        state.display_queue.get_nowait()
-                    except Exception:
-                        pass
+                    state.display_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    state.display_queue.put_nowait(disp)
+                except queue.Full:
+                    pass
 
 
 # ── Drawing utility ────────────────────────────────────────────────────────────

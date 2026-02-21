@@ -11,6 +11,7 @@ YOLO model, and pushes ``DetectionPacket`` objects into the detection queue.
 
 import os
 import time
+import queue
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -152,10 +153,12 @@ class InferenceThread(QtCore.QThread):
             imgsz = state.get_imgsz()
             stride = state.get_inference_stride()
             overlay = state.is_overlay_enabled()
+            skip_inference = stride > 1 and step % stride != 0
+            inferred_this_frame = False
+            all_dets: List[Detection] = cached_dets if skip_inference else []
 
-            all_dets: List[Detection] = cached_dets if (stride > 1 and step % stride != 0) else []
-
-            if overlay and self._models and not (stride > 1 and step % stride != 0):
+            if overlay and self._models and not skip_inference:
+                inferred_this_frame = True
                 # ── 1) Rider model drives BoT-SORT tracking ────────────────
                 if 1 in self._models and state.is_model_enabled(1):
                     try:
@@ -207,19 +210,21 @@ class InferenceThread(QtCore.QThread):
                 frame=frame,
                 detections=all_dets,
                 timestamp_ms=packet.timestamp_ms,
+                detections_fresh=inferred_this_frame,
             )
 
             # Push to detection queue; drop oldest if full.
-            placed = False
-            while not placed and not state.stop_event.is_set():
+            try:
+                state.detection_queue.put_nowait(det_packet)
+            except queue.Full:
                 try:
-                    state.detection_queue.put(det_packet, timeout=0.05)
-                    placed = True
-                except Exception:
-                    try:
-                        state.detection_queue.get_nowait()
-                    except Exception:
-                        pass
+                    state.detection_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    state.detection_queue.put_nowait(det_packet)
+                except queue.Full:
+                    pass
 
             # FPS reporting
             frame_count += 1

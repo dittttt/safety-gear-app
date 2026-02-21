@@ -6,6 +6,7 @@ frame queue.  Handles playback pacing, pause / resume, and seek requests.
 """
 
 import time
+import queue
 from typing import Optional
 
 import cv2
@@ -48,6 +49,7 @@ class FrameGrabberThread(QtCore.QThread):
         self.metaReady.emit(float(fps), total)
 
         frame_idx = 0
+        next_frame_time = time.perf_counter()
 
         while not state.stop_event.is_set():
             # ── Handle seek ────────────────────────────────────────────────
@@ -64,26 +66,26 @@ class FrameGrabberThread(QtCore.QThread):
                         ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                         packet = FramePacket(index=frame_idx, frame=frame, timestamp_ms=ts_ms)
 
-                        placed = False
-                        while not placed and not state.stop_event.is_set():
+                        try:
+                            state.frame_queue.put_nowait(packet)
+                        except queue.Full:
                             try:
-                                state.frame_queue.put(packet, timeout=0.05)
-                                placed = True
-                            except Exception:
-                                try:
-                                    state.frame_queue.get_nowait()
-                                except Exception:
-                                    pass
+                                state.frame_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                            try:
+                                state.frame_queue.put_nowait(packet)
+                            except queue.Full:
+                                pass
 
                         self.positionChanged.emit(frame_idx, ts_ms / 1000.0 if ts_ms else 0.0)
                         frame_idx += 1
 
             # ── Pause ──────────────────────────────────────────────────────
             if state.pause_event.is_set():
+                next_frame_time = time.perf_counter()
                 self.msleep(30)
                 continue
-
-            frame_start = time.perf_counter()
 
             ok, frame = cap.read()
             if not ok:
@@ -95,28 +97,42 @@ class FrameGrabberThread(QtCore.QThread):
 
             # Put into the queue; if full, drop the current frame rather than
             # blocking forever (keeps the grabber responsive to stop / seek).
-            placed = False
-            while not placed and not state.stop_event.is_set():
+            try:
+                state.frame_queue.put_nowait(packet)
+            except queue.Full:
                 try:
-                    state.frame_queue.put(packet, timeout=0.05)
-                    placed = True
-                except Exception:
-                    # Queue full — drop the oldest stale frame and retry
-                    try:
-                        state.frame_queue.get_nowait()
-                    except Exception:
-                        pass
+                    state.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    state.frame_queue.put_nowait(packet)
+                except queue.Full:
+                    pass
 
             self.positionChanged.emit(frame_idx, ts_ms / 1000.0 if ts_ms else 0.0)
             frame_idx += 1
 
             # ── Playback pacing ────────────────────────────────────────────
             rate = state.get_playback_rate()
-            target_delay = (1.0 / (fps * rate)) if fps > 0 and rate > 0 else 0.0
-            elapsed = time.perf_counter() - frame_start
-            sleep_s = target_delay - elapsed
-            if sleep_s > 0.001:
-                self.msleep(int(sleep_s * 1000))
+            effective_rate = rate * 1.03 if rate <= 1.0 else rate
+            frame_period = (1.0 / (fps * effective_rate)) if fps > 0 and effective_rate > 0 else 0.0
+            if frame_period > 0.0:
+                next_frame_time += frame_period
+                now = time.perf_counter()
+                if next_frame_time < now - (frame_period * 2.0):
+                    next_frame_time = now
+                sleep_s = max(0.0, next_frame_time - now - 0.0020)
+            else:
+                sleep_s = 0.0
+
+            if sleep_s > 0.0:
+                end_t = next_frame_time
+                while True:
+                    remaining = end_t - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    if remaining > 0.003:
+                        time.sleep(max(0.0, remaining - 0.001))
 
             # Frame-skipping for high playback rates (>=2×)
             if rate >= 2.0:
