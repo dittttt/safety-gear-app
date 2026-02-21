@@ -47,11 +47,18 @@ def _qss(s: float, chk: str) -> str:
         f"text-transform:uppercase;letter-spacing:1px;"
         f"padding:{px(8)} 0 {px(4)} 0;}}"
         f"#modelCard{{background:#141414;border:1px solid {_BD};"
-        f"border-radius:{px(5)};}}"
-        f"#modelCard:hover{{background:#1a1a1a;}}"
-        f"#modelTools{{background:transparent;}}"
-        f"#modelFile{{color:{_TD};font-size:{px(10)};padding:0;}}"
-        f"#modelFileLoaded{{color:{_TH};font-size:{px(10)};padding:0;}}"
+        f"border-radius:{px(5)};padding:{px(4)} 0;}}"
+        f"#modelFileBox{{background:#111;border-radius:{px(3)};"
+        f"border-left:3px solid #333;}}"
+        f"#modelFileBox *{{background:transparent;}}"
+        f"#modelFileIcon{{background:transparent;border:none;min-width:0;"
+        f"padding:0 {px(4)} 0 {px(2)};}}"
+        f"#modelFileIcon:hover{{background:rgba(255,255,255,0.08);"
+        f"border-radius:{px(2)};}}"
+        f"#modelFile{{color:{_TD};font-size:{px(10)};"
+        f"padding:{px(2)} {px(6)};background:transparent;}}"
+        f"#modelFileLoaded{{color:{_TH};font-size:{px(10)};"
+        f"padding:{px(2)} {px(6)};background:transparent;}}"
         f"#videoFileRow{{background:#181818;border:1px solid {_BD};"
         f"border-radius:{px(4)};}}"
         f"#videoFileRow *{{background:transparent;}}"
@@ -199,14 +206,19 @@ class MainWindow(QtWidgets.QMainWindow):
         return (color.blue(), color.green(), color.red())
 
     def _set_model_color_btn_style(self, cid: int) -> None:
-        btn = self._mcolor_btn[cid]
+        """Apply class colour accent and status text colour for model entry."""
+        lbl = self._mstat[cid]
+        box = self._mfile_box[cid]
         qcol = self._to_qcolor_bgr(self._state.get_class_color(cid))
-        btn.setStyleSheet(
-            f"QPushButton{{background:{qcol.name()};border:1px solid #555;"
-            f"border-radius:{int(4 * _S)}px;}}"
-            "QPushButton:hover{border:1px solid #888;}"
-            "QPushButton:pressed{border:1px solid #aaa;}"
-        )
+        loaded = lbl.objectName() == "modelFileLoaded"
+        fg = _TH if loaded else _TD
+        box.setStyleSheet(
+            f"QWidget#modelFileBox{{background:#111;border-radius:{int(3*_S)}px;"
+            f"border-left:3px solid {qcol.name()};}}")
+        lbl.setStyleSheet(
+            f"QLabel{{color:{fg};font-size:{int(10*_S)}px;"
+            f"padding:{int(2*_S)}px {int(6*_S)}px;"
+            "background:transparent;}")
 
     # ── ui ────────────────────────────────────────────────────────────────
 
@@ -230,7 +242,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splitter.addWidget(main)
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
-        self._splitter.setSizes([int(220 * _S), int(740 * _S)])
+        self._splitter.setCollapsible(0, False)
+        self._splitter.setSizes([int(230 * _S), int(730 * _S)])
 
         # top bar
         self._topBar = tb = QtWidgets.QWidget()
@@ -273,17 +286,19 @@ class MainWindow(QtWidgets.QMainWindow):
         olay = QtWidgets.QVBoxLayout(self._overlay)
         olay.setContentsMargins(0, 0, 0, 0); olay.setSpacing(0)
 
-        # seek bar – flush with control bar, tall enough for hover circle
+        # seek bar – centered inside the overlay hitbox
         skW = QtWidgets.QWidget(); skW.setObjectName("overlaySeek")
         # height = 2 × hover-circle-radius (+4 px breathing room) × scale
         _sk_h = int((8 * 2 + 4) * _S)  # = 30 px at 1.5×
         skW.setFixedHeight(_sk_h)
+        _sl_h = int(14 * _S)
+        _vpad = max(0, (_sk_h - _sl_h) // 2)
         sl = QtWidgets.QHBoxLayout(skW)
-        sl.setContentsMargins(int(12*_S), int(2*_S), int(12*_S), 0)
+        sl.setContentsMargins(int(12*_S), _vpad, int(12*_S), _vpad)
         sl.setSpacing(0)
         self.seekSlider = SeekSlider(scale=_S)
         self.seekSlider.setObjectName("seekSlider")
-        self.seekSlider.setFixedHeight(_sk_h)  # must match container so circle isn't clipped
+        self.seekSlider.setFixedHeight(_sl_h)
         self.seekSlider.setRange(0, 0); self.seekSlider.setEnabled(False)
         self.seekSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         sl.addWidget(self.seekSlider)
@@ -382,11 +397,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_sidebar(self) -> QtWidgets.QWidget:
         sb = QtWidgets.QWidget(); sb.setObjectName("sidebar")
-        sb.setMinimumWidth(int(180 * _S))
-        sb.setMaximumWidth(int(300 * _S))
+        sb.setMinimumWidth(int(200 * _S))
+        sb.setMaximumWidth(int(340 * _S))
         outer = QtWidgets.QVBoxLayout(sb)
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
         scroll = QtWidgets.QScrollArea()
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setWidgetResizable(True)
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -443,50 +459,56 @@ class MainWindow(QtWidgets.QMainWindow):
         # MODELS
         lay.addWidget(self._section("MODELS"))
         self._mbtn: Dict[int, QtWidgets.QPushButton] = {}
-        self._mcolor_btn: Dict[int, QtWidgets.QPushButton] = {}
         self._mstat: Dict[int, QtWidgets.QLabel] = {}
         self._mtog: Dict[int, QtWidgets.QCheckBox] = {}
-        bisz = int(12 * _S)
+        self._mfile_box: Dict[int, QtWidgets.QWidget] = {}
+        mcard = QtWidgets.QWidget(); mcard.setObjectName("modelCard")
+        ml = QtWidgets.QVBoxLayout(mcard)
+        ml.setContentsMargins(
+            int(8*_S), int(6*_S), int(8*_S), int(6*_S))
+        ml.setSpacing(int(5 * _S))
+        bisz = int(11 * _S)
         for cid in TARGET_CLASS_IDS:
             name = CLASS_NAMES[cid]
-            card = QtWidgets.QWidget(); card.setObjectName("modelCard")
-            cv = QtWidgets.QVBoxLayout(card)
-            cv.setContentsMargins(int(8*_S), int(6*_S), int(8*_S), int(6*_S))
-            cv.setSpacing(int(4 * _S))
-
-            row = QtWidgets.QHBoxLayout(); row.setSpacing(int(4 * _S))
-            chk = QtWidgets.QCheckBox(name); chk.setChecked(True)
-            self._mtog[cid] = chk; row.addWidget(chk, stretch=1)
-
-            tools = QtWidgets.QWidget(); tools.setObjectName("modelTools")
-            tr = QtWidgets.QHBoxLayout(tools)
-            tr.setContentsMargins(0, 0, 0, 0)
-            tr.setSpacing(int(4 * _S))
-
-            cbtn = QtWidgets.QPushButton()
-            cbtn.setToolTip(f"Change {name} color")
-            cbtn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            cbtn.setFixedSize(int(22*_S), int(22*_S))
-            cbtn.setFocusPolicy(QtCore.Qt.NoFocus)
-            self._mcolor_btn[cid] = cbtn
-            self._set_model_color_btn_style(cid)
-            tr.addWidget(cbtn)
+            block = QtWidgets.QWidget()
+            tv = QtWidgets.QVBoxLayout(block)
+            tv.setContentsMargins(0, 0, 0, 0)
+            tv.setSpacing(int(3 * _S))
+            chk = QtWidgets.QCheckBox(name)
+            chk.setChecked(True)
+            self._mtog[cid] = chk
+            tv.addWidget(chk)
+            file_box = QtWidgets.QWidget(); file_box.setObjectName("modelFileBox")
+            self._mfile_box[cid] = file_box
+            fr = QtWidgets.QHBoxLayout(file_box)
+            fr.setContentsMargins(0, 0, 0, 0)
+            fr.setSpacing(0)
+            st = QtWidgets.QLabel("\u2014")
+            st.setObjectName("modelFile")
+            st.setToolTip("Click to change colour")
+            st.setWordWrap(False)
+            st.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            st.setMinimumHeight(int(22 * _S))
+            st.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            self._mstat[cid] = st
+            fr.addWidget(st, stretch=1)
 
             btn = QtWidgets.QPushButton()
-            btn.setIcon(_fa("ellipsis-h", _TD, bisz))
+            btn.setObjectName("modelFileIcon")
+            btn.setIcon(_fa("folder-open", _TD, bisz))
             btn.setIconSize(QtCore.QSize(bisz, bisz))
-            btn.setFixedSize(int(22*_S), int(22*_S))
-            btn.setToolTip(f"Browse {name} model"); btn.setFlat(True)
+            btn.setFixedSize(int(24 * _S), int(22 * _S))
+            btn.setToolTip(f"Load {name} model")
+            btn.setFlat(True)
             btn.setFocusPolicy(QtCore.Qt.NoFocus)
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             self._mbtn[cid] = btn
-            tr.addWidget(btn)
-            row.addWidget(tools)
+            fr.addWidget(btn)
 
-            st = QtWidgets.QLabel("\u2014"); st.setObjectName("modelFile")
-            self._mstat[cid] = st
-            cv.addLayout(row)
-            cv.addWidget(st)
-            lay.addWidget(card)
+            self._set_model_color_btn_style(cid)
+            tv.addWidget(file_box)
+            ml.addWidget(block)
+        lay.addWidget(mcard)
         lay.addSpacing(int(6 * _S))
 
         # DETECTION
@@ -673,9 +695,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for cid, chk in self._mtog.items():
             chk.toggled.connect(
                 lambda v, c=cid: self._state.set_model_enabled(c, v))
-        for cid, cbtn in self._mcolor_btn.items():
-            cbtn.clicked.connect(
-                lambda _=False, c=cid: self._on_pick_model_color(c))
+        for cid, lbl in self._mstat.items():
+            lbl.mousePressEvent = (
+                lambda ev, c=cid: self._on_pick_model_color(c)
+                if ev.button() == QtCore.Qt.LeftButton else None)
         self.confSlider.valueChanged.connect(self._on_conf)
         self.iouSlider.valueChanged.connect(self._on_iou)
 
@@ -725,10 +748,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_model(self, cid: int, path: str) -> None:
         self._state.model_paths[cid] = path
         st = self._mstat[cid]
-        st.setText(os.path.basename(path))
+        base = os.path.basename(path)
+        fm = st.fontMetrics()
+        text_w = max(20, (st.width() if st.width() > 0 else int(120 * _S))
+                     - int(12 * _S))
+        st.setText(fm.elidedText(base, QtCore.Qt.ElideMiddle, text_w))
         st.setObjectName("modelFileLoaded")
         st.style().unpolish(st); st.style().polish(st)
         st.setToolTip(path)
+        self._set_model_color_btn_style(cid)
 
     def _on_files_dropped(self, paths: list) -> None:
         unknown: list[str] = []
