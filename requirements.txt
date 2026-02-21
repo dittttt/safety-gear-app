@@ -1,5 +1,11 @@
 PyQt5>=5.15
+qtawesome>=1.3
 opencv-python>=4.8
 ultralytics>=8.0
 numpy>=1.23
 lap>=0.5.12
+deep-sort-realtime>=1.3.2
+motmetrics>=1.4.0
+pandas>=1.5
+# Optional – for TensorRT export (requires NVIDIA GPU + CUDA):
+# tensorrt>=8.6

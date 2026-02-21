@@ -360,10 +360,28 @@ class SafetyGearDetectionApp:
         self.stop_btn.config(state="disabled", bg="#95a5a6")
         self.status_label.config(text="Detection stopped", fg="#e74c3c")
     
+    def _update_status(self, text, fg="#27ae60"):
+        """Thread-safe status update via main thread."""
+        self.root.after(0, lambda: self.status_label.config(text=text, fg=fg))
+
+    def _show_error(self, title, message):
+        """Thread-safe error dialog via main thread."""
+        self.root.after(0, lambda: messagebox.showerror(title, message))
+
+    def _cleanup_after_detection(self):
+        """Schedule UI cleanup on the main thread after detection ends."""
+        def _do_cleanup():
+            if self.cap:
+                self.cap.release()
+            cv2.destroyAllWindows()
+            self.start_btn.config(state="normal", bg="#27ae60")
+            self.stop_btn.config(state="disabled", bg="#95a5a6")
+        self.root.after(0, _do_cleanup)
+
     def run_detection(self):
         try:
             # Update status
-            self.status_label.config(text="Loading model...", fg="#f39c12")
+            self._update_status("Loading model...", "#f39c12")
             
             # Load model
             model_path = self.selected_model.get().replace(" (will download)", "")
@@ -386,7 +404,7 @@ class SafetyGearDetectionApp:
             class_names = self.model.names
             
             # Open video source
-            self.status_label.config(text="Opening video source...", fg="#f39c12")
+            self._update_status("Opening video source...", "#f39c12")
             
             if self.selected_input.get() == "camera":
                 camera_idx = int(self.camera_index.get())
@@ -397,12 +415,9 @@ class SafetyGearDetectionApp:
             if not self.cap.isOpened():
                 raise Exception("Could not open video source")
             
-            # Get screen resolution
-            root_temp = tk.Tk()
-            root_temp.withdraw()
-            screen_width = root_temp.winfo_screenwidth()
-            screen_height = root_temp.winfo_screenheight()
-            root_temp.destroy()
+            # Get screen resolution from the existing root (thread-safe read)
+            screen_width = self.root.winfo_screenwidth()
+            screen_height = self.root.winfo_screenheight()
             
             max_display_width = int(screen_width * 0.8)
             max_display_height = int(screen_height * 0.8)
@@ -411,7 +426,7 @@ class SafetyGearDetectionApp:
             window_name = "Safety Gear Detection – Real-Time"
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
             
-            self.status_label.config(text="Running detection... (Press Q to stop)", fg="#27ae60")
+            self._update_status("Running detection... (Press Q to stop)", "#27ae60")
             
             # Main detection loop
             while self.is_running:
@@ -419,7 +434,7 @@ class SafetyGearDetectionApp:
                 ret, frame = self.cap.read()
                 
                 if not ret:
-                    self.status_label.config(text="End of video reached", fg="#e74c3c")
+                    self._update_status("End of video reached", "#e74c3c")
                     break
                 
                 # YOLO Inference
@@ -554,12 +569,14 @@ class SafetyGearDetectionApp:
                 if key == ord('q') or key == ord('Q'):
                     break
             
-            # Clean up
-            self.stop_detection()
+            # Clean up (schedule on main thread to avoid self-join)
+            self.is_running = False
+            self._cleanup_after_detection()
             
         except Exception as e:
-            messagebox.showerror("Error", f"Detection error: {str(e)}")
-            self.stop_detection()
+            self.is_running = False
+            self._show_error("Error", f"Detection error: {str(e)}")
+            self._cleanup_after_detection()
     
     def calculate_intersection(self, box1, box2):
         x1 = max(box1[0], box2[0])

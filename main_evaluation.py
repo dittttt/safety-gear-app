@@ -187,12 +187,24 @@ def evaluate_tracking(
     print("Loading ground truth...")
     gt_df = _read_mot_gt(gt_file_path)
 
-    acc = mm.utils.compare_to_groundtruth(
-        gt_df,
-        pred_df,
-        distfunc=mm.distances.iou_matrix,
-        distth=0.5,
-    )
+    # Build MOTAccumulator frame-by-frame
+    acc = mm.MOTAccumulator(auto_id=True)
+
+    all_frames = sorted(set(gt_df["FrameId"].tolist()) | set(pred_df["FrameId"].tolist()))
+
+    for fid in all_frames:
+        gt_frame = gt_df[gt_df["FrameId"] == fid]
+        pred_frame = pred_df[pred_df["FrameId"] == fid]
+
+        gt_ids = gt_frame["Id"].values
+        pred_ids = pred_frame["Id"].values
+
+        # Build bounding-box arrays as [[x, y, w, h], ...]
+        gt_boxes = gt_frame[["X", "Y", "Width", "Height"]].values
+        pred_boxes = pred_frame[["X", "Y", "Width", "Height"]].values
+
+        distances = mm.distances.iou_matrix(gt_boxes, pred_boxes, max_iou=0.5)
+        acc.update(gt_ids, pred_ids, distances)
 
     mh = mm.metrics.create()
     summary = mh.compute(
