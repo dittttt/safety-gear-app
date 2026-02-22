@@ -81,7 +81,8 @@ def detect() -> RuntimeInfo:
     try:
         import torch
         info.has_cuda = torch.cuda.is_available()
-        info.torch_cuda_ver = torch.version.cuda or ""
+        torch_version = getattr(torch, "version", None)
+        info.torch_cuda_ver = str(getattr(torch_version, "cuda", "") or "")
         if info.has_cuda:
             info.cuda_device = torch.cuda.get_device_name(0)
     except ImportError:

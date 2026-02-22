@@ -164,14 +164,6 @@ class ConvertWorker(QtCore.QThread):
                 )
             finally:
                 self._active_proc = None
-
-            # Build a compat object so the rest of the code is unchanged
-            class _R:
-                pass
-            proc = _R()
-            proc.stdout = stdout
-            proc.stderr = stderr
-            proc.returncode = returncode
         except TimeoutError:
             raise
         except OSError as exc:
@@ -179,8 +171,8 @@ class ConvertWorker(QtCore.QThread):
                 f"failed to start export subprocess: {exc}"
             ) from exc
 
-        out_json = self._extract_json_line(proc.stdout)
-        if proc.returncode == 0 and out_json:
+        out_json = self._extract_json_line(stdout)
+        if returncode == 0 and out_json:
             try:
                 import json
                 payload = json.loads(out_json)
@@ -190,19 +182,19 @@ class ConvertWorker(QtCore.QThread):
                 pass
 
         details = []
-        err_json = self._extract_json_line(proc.stderr)
+        err_json = self._extract_json_line(stderr)
         if out_json:
             details.append(f"stdout-json={out_json}")
         if err_json:
             details.append(f"stderr-json={err_json}")
-        if proc.stdout and not out_json:
-            details.append(f"stdout={proc.stdout.strip()[-800:]}")
-        if proc.stderr and not err_json:
-            details.append(f"stderr={proc.stderr.strip()[-800:]}")
+        if stdout and not out_json:
+            details.append(f"stdout={stdout.strip()[-800:]}")
+        if stderr and not err_json:
+            details.append(f"stderr={stderr.strip()[-800:]}")
         detail_txt = "\n".join(details).strip()
 
         raise RuntimeError(
-            f"export subprocess failed (format={fmt}, code={proc.returncode})"
+            f"export subprocess failed (format={fmt}, code={returncode})"
             + (f"\n{detail_txt}" if detail_txt else "")
         )
 
