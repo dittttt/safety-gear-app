@@ -177,6 +177,14 @@ class PipelineState:
         with self._lock:
             return int(self.detection_config.imgsz)
 
+    def get_inference_batch_size(self) -> int:
+        with self._lock:
+            return max(1, int(self.detection_config.inference_batch_size))
+
+    def set_inference_batch_size(self, val: int) -> None:
+        with self._lock:
+            self.detection_config.inference_batch_size = max(1, min(128, int(val)))
+
     def set_imgsz(self, val: int) -> None:
         with self._lock:
             size = int(val)

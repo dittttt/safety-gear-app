@@ -1,11 +1,12 @@
 """
 Thread 2 – Inference Engine
 ===========================
-Pulls ``FramePacket`` objects from the frame queue, runs every *enabled*
-YOLO model, and pushes ``DetectionPacket`` objects into the detection queue.
+Consumes ``FramePacket`` items from the frame queue in batches, runs YOLO
+detection for every enabled model, and pushes per-frame ``DetectionPacket``
+objects into the detection queue.
 
-* **Rider model** (class 1) uses ``model.track()`` for built-in BoT-SORT IDs.
-* All other models use ``model.predict()`` (detection only, no tracker state).
+* Batched detection defaults to 32 frames (configurable in shared state).
+* Tracking is handled by the downstream tracking thread.
 * Supports ``.pt`` (PyTorch), ``.engine`` (TensorRT), and ``.onnx`` weights.
 """
 
@@ -23,7 +24,6 @@ import torch
 
 from config import TARGET_CLASS_IDS, CLASS_NAMES
 from pipeline.state import PipelineState, Detection, DetectionPacket
-from utils.runtime_check import detect as detect_runtime
 
 
 class InferenceThread(QtCore.QThread):
@@ -36,6 +36,7 @@ class InferenceThread(QtCore.QThread):
         super().__init__(parent)
         self._state = state
         self._models: Dict[int, YOLO] = {}
+        self._model_paths: Dict[int, str] = {}
         self._device: str = "cpu"
         self._fp16: bool = False
         # Suppress noisy backend setup chatter (especially TensorRT/OpenVINO)
@@ -67,6 +68,7 @@ class InferenceThread(QtCore.QThread):
         whatever path is stored in ``state.model_paths``.
         """
         self._models.clear()
+        self._model_paths.clear()
         self._device = self._resolve_device()
         self._fp16 = self._state.use_fp16() and self._device.startswith("cuda")
         for cid in TARGET_CLASS_IDS:
@@ -86,12 +88,51 @@ class InferenceThread(QtCore.QThread):
                         except Exception:
                             pass
                 self._models[cid] = model
+                self._model_paths[cid] = path
             except Exception as exc:
                 self.status.emit(f"Failed to load {name} ({tag}): {exc}")
         self.status.emit(
             f"Inference backend: {self._device}"
             f"{' + FP16' if self._fp16 else ''}"
         )
+
+    def _predict_kwargs_for(self, cid: int, conf: float, iou: float, imgsz: int) -> dict:
+        """Backend-aware kwargs: avoid problematic runtime args on exported engines."""
+        kwargs = {
+            "conf": conf,
+            "iou": iou,
+            "imgsz": imgsz,
+            "verbose": False,
+        }
+        path = str(self._model_paths.get(cid, "")).lower()
+        is_pt = path.endswith(".pt")
+        if is_pt:
+            kwargs["device"] = self._device
+            kwargs["half"] = self._fp16
+        return kwargs
+
+    def _predict_with_fallback(self, cid: int, frames: List[np.ndarray], kwargs: dict):
+        """Try batch predict first; fallback to per-frame on backend limitations."""
+        model = self._models[cid]
+        try:
+            results = model.predict(frames, **kwargs)
+            if isinstance(results, (list, tuple)) and len(results) == len(frames):
+                return list(results)
+        except Exception:
+            pass
+
+        # Backend may not support list/batch inputs reliably; fallback safely
+        out = []
+        for frame in frames:
+            try:
+                r = model.predict(frame, **kwargs)
+                if isinstance(r, (list, tuple)):
+                    out.append(r[0] if r else None)
+                else:
+                    out.append(r)
+            except Exception:
+                out.append(None)
+        return out
 
     # ── Detection extraction helpers ───────────────────────────────────────────
 
@@ -129,18 +170,6 @@ class InferenceThread(QtCore.QThread):
             dets.append(Detection(x1, y1, x2, y2, class_id, score, tid))
         return dets
 
-    # ── Tracker YAML resolution ────────────────────────────────────────────────
-
-    def _resolve_tracker_yaml(self) -> str:
-        key = self._state.detection_config.tracker_key
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        candidates = {
-            "botsort": os.path.join(base, "trackers", "botsort.yaml"),
-            "bytetrack": os.path.join(base, "trackers", "bytetrack.yaml"),
-        }
-        path = candidates.get(key, candidates["botsort"])
-        return path if os.path.isfile(path) else candidates["botsort"]
-
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:  # noqa: C901
@@ -150,8 +179,6 @@ class InferenceThread(QtCore.QThread):
         if not self._models:
             self.status.emit("No models loaded — overlay will be disabled")
 
-        tracker_yaml = self._resolve_tracker_yaml()
-        persist_tracking = False
         frame_count = 0
         t0 = time.perf_counter()
         step = 0
@@ -163,93 +190,74 @@ class InferenceThread(QtCore.QThread):
                 state.reload_models_flag = False
                 self._load_models()
 
-            # Pull next frame (with short timeout so we can still check stop).
+            # Pull first frame for this cycle.
             try:
-                packet = state.frame_queue.get(timeout=0.05)
+                first_packet = state.frame_queue.get(timeout=0.05)
             except Exception:
                 continue
 
             if state.stop_event.is_set():
                 break
 
-            # Tracker reset after seek
-            if state.reset_tracker_flag:
-                persist_tracking = False
-                state.reset_tracker_flag = False
+            # Build a frame batch (first + any immediately available packets)
+            batch_size = state.get_inference_batch_size()
+            packets = [first_packet]
+            while len(packets) < batch_size:
+                try:
+                    packets.append(state.frame_queue.get_nowait())
+                except queue.Empty:
+                    break
 
-            frame = packet.frame
             conf = state.get_conf()
             iou = state.get_iou()
             imgsz = state.get_imgsz()
             stride = state.get_inference_stride()
             overlay = state.is_overlay_enabled()
-            skip_inference = stride > 1 and step % stride != 0
-            inferred_this_frame = False
-            all_dets: List[Detection] = cached_dets if skip_inference else []
 
-            if overlay and self._models and not skip_inference:
-                inferred_this_frame = True
-                # ── 1) Rider model drives BoT-SORT tracking ────────────────
-                if 1 in self._models and state.is_model_enabled(1):
-                    try:
-                        results = self._models[1].track(
-                            frame,
-                            conf=conf,
-                            iou=iou,
-                            imgsz=imgsz,
-                            half=self._fp16,
-                            device=self._device,
-                            persist=persist_tracking,
-                            tracker=tracker_yaml,
-                            verbose=False,
-                        )
-                        persist_tracking = True
-                        r0 = results[0] if isinstance(results, (list, tuple)) else results
-                        all_dets.extend(
-                            self._extract_detections(r0, class_id=1, include_track_ids=True)
-                        )
-                    except Exception as exc:
-                        self.status.emit(f"Rider inference error: {exc}")
+            infer_idxs = [
+                i for i in range(len(packets))
+                if (stride <= 1 or ((step + i) % stride == 0))
+            ]
+            infer_set = set(infer_idxs)
+            dets_by_idx: Dict[int, List[Detection]] = {i: [] for i in infer_idxs}
 
-                # ── 2) Other models run prediction (no tracker) ────────────
+            if overlay and self._models and infer_idxs:
+                infer_frames = [packets[i].frame for i in infer_idxs]
                 for cid in TARGET_CLASS_IDS:
-                    if cid == 1:
-                        continue
                     if cid not in self._models or not state.is_model_enabled(cid):
                         continue
-                    try:
-                        results = self._models[cid].predict(
-                            frame,
-                            conf=conf,
-                            iou=iou,
-                            imgsz=imgsz,
-                            half=self._fp16,
-                            device=self._device,
-                            verbose=False,
-                        )
-                        r0 = results[0] if isinstance(results, (list, tuple)) else results
-                        all_dets.extend(self._extract_detections(r0, class_id=cid))
-                    except Exception as exc:
-                        self.status.emit(
-                            f"Inference error ({CLASS_NAMES.get(cid, cid)}): {exc}"
+                    kwargs = self._predict_kwargs_for(cid, conf, iou, imgsz)
+                    results = self._predict_with_fallback(cid, infer_frames, kwargs)
+                    for local_i, result in enumerate(results):
+                        if local_i >= len(infer_idxs) or result is None:
+                            continue
+                        pkt_i = infer_idxs[local_i]
+                        dets_by_idx[pkt_i].extend(
+                            self._extract_detections(result, class_id=cid)
                         )
 
-            cached_dets = all_dets
-            det_packet = DetectionPacket(
-                index=packet.index,
-                frame=frame,
-                detections=all_dets,
-                timestamp_ms=packet.timestamp_ms,
-                detections_fresh=inferred_this_frame,
-            )
+            for i, packet in enumerate(packets):
+                inferred_this_frame = i in infer_set and overlay and bool(self._models)
+                if inferred_this_frame:
+                    all_dets = dets_by_idx.get(i, [])
+                    cached_dets = all_dets
+                else:
+                    all_dets = list(cached_dets)
 
-            state.put_safe(state.detection_queue, det_packet)
+                det_packet = DetectionPacket(
+                    index=packet.index,
+                    frame=packet.frame,
+                    detections=all_dets,
+                    timestamp_ms=packet.timestamp_ms,
+                    detections_fresh=inferred_this_frame,
+                )
+                state.put_safe(state.detection_queue, det_packet)
 
             # FPS reporting
-            frame_count += 1
+            frame_count += len(packets)
             now = time.perf_counter()
             if now - t0 >= 1.0:
                 self.fps_update.emit(frame_count / (now - t0))
                 frame_count = 0
                 t0 = now
-            step += 1
+            step += len(packets)

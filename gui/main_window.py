@@ -261,10 +261,11 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Safety Gear Compliance")
         self.setMinimumSize(1024, 600)
-        self.resize(1670, 760)
+        self.resize(1630, 760)
         self.setAcceptDrops(True)
         self._chk = self._make_checkmark_icon()
         self._state = PipelineState()
+        self._state.set_overlay_enabled(True)
         self._grabber: Optional[FrameGrabberThread] = None
         self._inferencer: Optional[InferenceThread] = None
         self._tracker: Optional[TrackerLogicThread] = None
@@ -361,7 +362,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setCollapsible(0, False)
-        self._splitter.setSizes([int(280 * _S), int(640 * _S)])
+        self._splitter.setSizes([int(260 * _S), int(805 * _S)])
 
         # top bar
         self._topBar = tb = QtWidgets.QWidget()
