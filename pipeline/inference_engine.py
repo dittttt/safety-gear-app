@@ -12,18 +12,18 @@ YOLO model, and pushes ``DetectionPacket`` objects into the detection queue.
 import os
 import time
 import queue
+import logging
 from typing import Dict, List, Optional
 
 import numpy as np
 from PyQt5 import QtCore
 from ultralytics import YOLO
+from ultralytics.utils import LOGGER as ULTRA_LOGGER
 import torch
 
-from config import (
-    TARGET_CLASS_IDS, CLASS_NAMES,
-    OPTIMIZED_GPU_DIR, OPTIMIZED_CPU_DIR,
-)
+from config import TARGET_CLASS_IDS, CLASS_NAMES
 from pipeline.state import PipelineState, Detection, DetectionPacket
+from utils.runtime_check import detect as detect_runtime
 
 
 class InferenceThread(QtCore.QThread):
@@ -38,6 +38,8 @@ class InferenceThread(QtCore.QThread):
         self._models: Dict[int, YOLO] = {}
         self._device: str = "cpu"
         self._fp16: bool = False
+        # Suppress noisy backend setup chatter (especially TensorRT/OpenVINO)
+        ULTRA_LOGGER.setLevel(logging.WARNING)
 
     def _resolve_device(self) -> str:
         device = self._state.get_device()
@@ -47,66 +49,45 @@ class InferenceThread(QtCore.QThread):
             return "cuda:0" if torch.cuda.is_available() else "cpu"
         return "cuda:0" if torch.cuda.is_available() else "cpu"
 
+    @staticmethod
+    def _path_exists(path: str) -> bool:
+        return bool(path) and (os.path.isfile(path) or os.path.isdir(path))
+
+    @staticmethod
+    def _can_move_to_device(path: str) -> bool:
+        return str(path).lower().endswith(".pt")
+
     # ── Model management ───────────────────────────────────────────────────────
 
-    def _resolve_optimized_path(self, original_path: str) -> str:
-        """Return the best optimised model path for the current device, else *original_path*.
-
-        GPU preference: .engine  > .onnx (CUDA)  > .pt
-        CPU preference: _openvino_model/  > .onnx  > .pt
-        """
-        if not original_path or not original_path.lower().endswith(".pt"):
-            return original_path
-        basename = os.path.splitext(os.path.basename(original_path))[0]
-        is_gpu = self._device.startswith("cuda")
-        if is_gpu:
-            # Best: TensorRT engine
-            engine = os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.engine")
-            if os.path.isfile(engine):
-                return engine
-            # Fallback: ONNX (runs on CUDAExecutionProvider)
-            onnx = os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.onnx")
-            if os.path.isfile(onnx):
-                return onnx
-        else:
-            # Best: OpenVINO IR directory
-            ov_dir = os.path.join(OPTIMIZED_CPU_DIR, f"{basename}_openvino_model")
-            if os.path.isdir(ov_dir):
-                return ov_dir
-            # Fallback: ONNX (runs on CPUExecutionProvider)
-            onnx = os.path.join(OPTIMIZED_CPU_DIR, f"{basename}.onnx")
-            if os.path.isfile(onnx):
-                return onnx
-        return original_path
-
     def _load_models(self) -> None:
-        """(Re)load models from current ``state.model_paths``."""
+        """(Re)load models from current ``state.model_paths``.
+
+        The GUI / model-registry is responsible for choosing the correct
+        variant (PyTorch, TensorRT, OpenVINO …).  This method simply loads
+        whatever path is stored in ``state.model_paths``.
+        """
         self._models.clear()
         self._device = self._resolve_device()
         self._fp16 = self._state.use_fp16() and self._device.startswith("cuda")
         for cid in TARGET_CLASS_IDS:
             path = self._state.model_paths.get(cid)
-            if not path or not os.path.isfile(path):
+            if not self._path_exists(path):
                 continue
-            resolved = self._resolve_optimized_path(path)
             name = CLASS_NAMES.get(cid, str(cid))
-            tag = os.path.basename(resolved)
+            tag = os.path.basename(path)
             self.status.emit(f"Loading {name}: {tag}")
             try:
-                model = YOLO(resolved)
-                model.to(self._device)
+                model = YOLO(path, task="detect", verbose=False)
+                if self._can_move_to_device(path):
+                    model.to(self._device)
+                    if self._fp16:
+                        try:
+                            model.model.half()
+                        except Exception:
+                            pass
                 self._models[cid] = model
             except Exception as exc:
                 self.status.emit(f"Failed to load {name} ({tag}): {exc}")
-                # Fallback to original .pt if optimised version failed
-                if resolved != path:
-                    self.status.emit(f"Falling back to {os.path.basename(path)}")
-                    try:
-                        model = YOLO(path)
-                        model.to(self._device)
-                        self._models[cid] = model
-                    except Exception as exc2:
-                        self.status.emit(f"Also failed on fallback: {exc2}")
         self.status.emit(
             f"Inference backend: {self._device}"
             f"{' + FP16' if self._fp16 else ''}"

@@ -33,8 +33,8 @@ def _get_logger() -> logging.Logger:
     log = logging.getLogger("convert_worker")
     if not log.handlers:
         try:
-            from config import OPTIMIZED_GPU_DIR
-            log_dir = os.path.dirname(os.path.dirname(OPTIMIZED_GPU_DIR))
+            from utils.model_registry import MODELS_DIR
+            log_dir = MODELS_DIR
         except Exception:
             log_dir = os.getcwd()
         fh = logging.FileHandler(
@@ -89,9 +89,9 @@ class ConvertWorker(QtCore.QThread):
     # ── helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _target_dir(device_key: str) -> str:
-        from config import OPTIMIZED_GPU_DIR, OPTIMIZED_CPU_DIR
-        return OPTIMIZED_GPU_DIR if device_key != "cpu" else OPTIMIZED_CPU_DIR
+    def _target_dir(stem: str) -> str:
+        from utils.model_registry import model_dir_for
+        return model_dir_for(stem)
 
     @staticmethod
     def _best_format(device_key: str) -> str:
@@ -125,7 +125,7 @@ class ConvertWorker(QtCore.QThread):
             "imgsz = int(imgsz_s)",
             "half = (half_s == '1')",
             "try:",
-            "    m = YOLO(mp)",
+            "    m = YOLO(mp, task='detect')",
             "    out = m.export(format=fmt, half=half, imgsz=imgsz)",
             "    out_s = str(out) if out else ''",
             "    if not out_s:",
@@ -212,7 +212,7 @@ class ConvertWorker(QtCore.QThread):
 
             basename = os.path.splitext(os.path.basename(pt_path))[0]
             fmt = self._best_format(device_key)
-            target_dir = self._target_dir(device_key)
+            target_dir = self._target_dir(basename)
 
             # If TRT already failed once, skip straight to ONNX fallback
             if fmt == "engine" and self._trt_failed:
@@ -242,9 +242,15 @@ class ConvertWorker(QtCore.QThread):
             try:
                 os.makedirs(target_dir, exist_ok=True)
 
-                # ── 1) Copy .pt into target directory ──────────────────────
-                temp_pt = os.path.join(target_dir, os.path.basename(pt_path))
-                shutil.copy2(pt_path, temp_pt)
+                # ── 1) Ensure .pt is accessible in target directory ────────
+                dest_pt = os.path.join(target_dir, os.path.basename(pt_path))
+                if os.path.normpath(pt_path) != os.path.normpath(dest_pt):
+                    shutil.copy2(pt_path, dest_pt)
+                    temp_pt = dest_pt   # mark copy for cleanup
+
+                # Track pre-existing ONNX (TRT creates an intermediate one)
+                onnx_pre = os.path.isfile(
+                    os.path.join(target_dir, f"{basename}.onnx"))
 
                 # ── 2) Export via Ultralytics ──────────────────────────────
                 msg = f"{tag} Exporting {basename} → {fmt.upper()} (imgsz={imgsz})"
@@ -262,7 +268,7 @@ class ConvertWorker(QtCore.QThread):
                     timeout_s = self.ONNX_TIMEOUT_SEC
                 try:
                     result_path = self._export_in_subprocess(
-                        model_path=temp_pt,
+                        model_path=dest_pt,
                         fmt=fmt,
                         imgsz=imgsz,
                         half=(half if fmt == "engine" else False),
@@ -285,7 +291,7 @@ class ConvertWorker(QtCore.QThread):
                             f"{tag} TensorRT failed; falling back to ONNX for {basename}…",
                         )
                         result_path = self._export_in_subprocess(
-                            model_path=temp_pt,
+                            model_path=dest_pt,
                             fmt="onnx",
                             imgsz=imgsz,
                             half=False,
@@ -303,8 +309,9 @@ class ConvertWorker(QtCore.QThread):
                 if temp_pt and os.path.isfile(temp_pt):
                     os.remove(temp_pt)
 
-                # TensorRT generates an intermediate ONNX – remove it
-                if final_fmt == "engine":
+                # TensorRT generates an intermediate ONNX – remove only
+                # if it did not exist before the export
+                if final_fmt == "engine" and not onnx_pre:
                     onnx_path = os.path.join(target_dir, f"{basename}.onnx")
                     if os.path.isfile(onnx_path):
                         os.remove(onnx_path)

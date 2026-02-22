@@ -82,7 +82,5 @@ DEFAULT_MODEL_FILES: Dict[int, str] = {
     CLASS_IMPROPER_FOOTWEAR: "improper_footwear.pt",
 }
 
-# ── Optimised model directories ───────────────────────────────────────────────
-OPTIMIZED_DIR     = os.path.join(_ROOT, "models", "optimized")
-OPTIMIZED_GPU_DIR = os.path.join(OPTIMIZED_DIR, "GPU")
-OPTIMIZED_CPU_DIR = os.path.join(OPTIMIZED_DIR, "CPU")
+# ── Models root directory ──────────────────────────────────────────────────────
+MODELS_DIR = os.path.join(_ROOT, "models")

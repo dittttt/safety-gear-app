@@ -42,7 +42,7 @@ def export_model(
     """Export a single YOLO .pt model and return the output path."""
     print(f"\n{'='*60}")
     print(f"Loading : {model_path}")
-    model = YOLO(model_path)
+    model = YOLO(model_path, task="detect")
 
     print(f"Exporting to {fmt}  (half={half}, imgsz={imgsz}) …")
     exported = model.export(format=fmt, half=half, imgsz=imgsz)

@@ -10,8 +10,9 @@ import cv2, numpy as np, qtawesome as qta
 import torch
 from PyQt5 import QtCore, QtGui, QtWidgets
 from config import (TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS,
-                    MODEL_EXTENSIONS, DEFAULT_MODEL_FILES,
-                    OPTIMIZED_GPU_DIR, OPTIMIZED_CPU_DIR)
+                    MODEL_EXTENSIONS, DEFAULT_MODEL_FILES)
+from utils.model_registry import (discover_models, model_dir_for,
+                                   _detect_format, _FORMAT_LABEL)
 from pipeline.state import PipelineState
 from pipeline.frame_grabber import FrameGrabberThread
 from pipeline.inference_engine import InferenceThread
@@ -26,9 +27,57 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BG = "#0d0d0d"; _BG_SB = "#0f0f0f"; _BD = "#1e1e1e"
 _T = "#b0b0b0"; _TD = "#555555"; _TH = "#e0e0e0"; _W = "#ffffff"
 _HOV = "rgba(255,255,255,0.07)"; _PRS = "rgba(255,255,255,0.14)"
+_R = 6          # base border-radius in logical px (multiplied by _S)
 
 def _fa(name, color=_T, sz=18):
     return qta.icon(f"fa5s.{name}", color=color)
+
+
+class _AlignedComboBox(QtWidgets.QComboBox):
+    """QComboBox that shows a speed-menu-style QMenu popup instead of the
+    native Qt dropdown, giving full style control."""
+
+    def showPopup(self) -> None:
+        menu = QtWidgets.QMenu(self)
+        menu.setWindowFlags(
+            menu.windowFlags()
+            | QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.NoDropShadowWindowHint
+        )
+        menu.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        _mr     = int(_R * _S)
+        _hpad   = int(10 * _S)
+        _vpad   = int(4  * _S)   # matches combo's vertical padding
+        _item_h = int(20 * _S)   # matches combo's min-height → same 42 px total
+        menu.setStyleSheet(
+            f"QMenu{{background:#161616;color:{_T};"
+            f"border:1px solid {_BD};border-radius:{_mr}px;"
+            f"padding:0;}}"
+            f"QMenu::item{{padding:{_vpad}px {_hpad}px;"
+            f"font-size:{int(10*_S)}px;"
+            f"font-family:'Consolas','Courier New',monospace;"
+            f"min-height:{_item_h}px;}}"
+            f"QMenu::item:selected{{background:#2a2a2a;color:{_TH};}}"
+            f"QMenu::item:checked{{background:#2a2a2a;color:{_TH};}}"
+            f"QMenu::indicator{{width:0;height:0;}}"
+        )
+        fm = menu.fontMetrics()
+        max_text_w = max(
+            (fm.horizontalAdvance(self.itemText(i))
+             for i in range(self.count())),
+            default=0,
+        )
+        popup_w = max(self.width(), max_text_w + _hpad * 2 + int(8 * _S))
+        menu.setFixedWidth(popup_w)
+        for i in range(self.count()):
+            act = menu.addAction(self.itemText(i))
+            act.setData(i)
+            act.setCheckable(True)
+            act.setChecked(i == self.currentIndex())
+        pos = self.mapToGlobal(QtCore.QPoint(0, self.height()))
+        chosen = menu.exec_(pos)
+        if chosen is not None:
+            self.setCurrentIndex(chosen.data())
 
 _S = 1.5  # fixed UI scale – no dynamic rescaling
 _DROP_PROMPT = "Drop a video here or use the sidebar to load one"
@@ -53,9 +102,16 @@ _CLASS_INFER_TRANSLATE = str.maketrans("-_.", "   ")
 def _qss(s: float, chk: str) -> str:
     """Full stylesheet – every pixel value multiplied by *s*."""
     def px(v): return f"{max(1, round(v * s))}px"
+    _r = px(_R)  # consistent corner radius
+    _r_sm = px(max(1, _R - 2))  # smaller radius for tiny elements
+    # dot handle: seek slider custom‐painted, sidebar drawn by QSS
+    _dot = px(8)          # sidebar handle diameter
+    _dot_r = px(4)        # sidebar handle radius = diameter / 2
+    _dot_m = px(3)        # negative margin so handle extends beyond groove
     return (
+        f"*{{outline:0;}}"
         f"QMainWindow,QWidget{{background:{_BG};color:{_T};"
-        f"font-family:'Segoe UI','Arial',sans-serif;font-size:{px(12)};}}"
+        f"font-family:'Segoe UI',sans-serif;font-size:{px(12)};}}"
         f"#topBar{{background:{_BG};border-bottom:1px solid {_BD};}}"
         f"#topBar QLabel{{background:transparent;}}"
         f"#topBarTitle{{color:{_TH};font-size:{px(13)};font-weight:600;"
@@ -69,13 +125,11 @@ def _qss(s: float, chk: str) -> str:
         f"padding:{px(14)} 0 {px(4)} 0;}}"
         f"#modelCard{{background:transparent;border:none;"
         f"border-radius:0;padding:{px(2)} 0;margin:0;}}"
-        f"#modelFileBox{{background:transparent;border-radius:0;"
-        f"border-left:2px solid #333;}}"
-        f"#modelFileBox *{{background:transparent;}}"
         f"#modelFileIcon{{background:transparent;border:none;min-width:0;"
         f"padding:0;margin:0;}}"
         f"#modelFileIcon:hover{{background:rgba(255,255,255,0.06);"
-        f"border-radius:{px(2)};}}"
+        f"border-radius:{_r_sm};}}"
+        f"#modelFileIcon:focus{{outline:none;border:none;background:transparent;}}"
         f"#modelFile{{color:{_TD};font-size:{px(11)};"
         f"padding:{px(2)} {px(6)};background:transparent;}}"
         f"#modelFileLoaded{{color:{_TH};font-size:{px(11)};"
@@ -84,23 +138,24 @@ def _qss(s: float, chk: str) -> str:
         f"border-radius:0;}}"
         f"#videoFileRow *{{background:transparent;}}"
         f"#videoFileRow:hover{{background:rgba(255,255,255,0.04);}}"
+        # buttons
         f"QPushButton{{background:{_BG};color:{_T};border:1px solid {_BD};"
-        f"border-radius:{px(4)};padding:{px(5)} {px(12)};"
+        f"border-radius:{_r};padding:{px(5)} {px(12)};"
         f"font-size:{px(11)};}}"
         f"QPushButton:hover{{background:#1a1a1a;}}"
         f"QPushButton:pressed{{background:#222;}}"
         f"QPushButton:disabled{{background:{_BG};color:#333;border-color:#151515;}}"
-        f"QPushButton:focus{{outline:none;}}"
+        f"QPushButton:focus{{outline:none;border-color:{_BD};background:{_BG};}}"
         f"#iconBtn{{background:transparent;border:none;"
-        f"border-radius:{px(4)};padding:0;"
-        f"outline:none;}}"
+        f"border-radius:{_r};padding:0;outline:none;}}"
         f"#iconBtn:hover{{background:{_HOV};}}"
         f"#iconBtn:pressed{{background:{_PRS};}}"
-        f"#iconBtn:focus{{outline:none;background:transparent;}}"
+        f"#iconBtn:focus{{outline:none;border:none;background:transparent;}}"
         f"#closeVideoBtn{{background:transparent;border:none;"
         f"padding:0;margin:0;min-width:0;}}"
         f"#closeVideoBtn:hover{{background:rgba(255,255,255,0.08);"
-        f"border-radius:{px(3)};}}"
+        f"border-radius:{_r_sm};}}"
+        f"#closeVideoBtn:focus{{outline:none;border:none;background:transparent;}}"
         # seek slider – groove only; circle drawn by SeekSlider.paintEvent
         f"QSlider#seekSlider::groove:horizontal{{height:{px(4)};"
         f"background:#4d4d4d;border:none;border-radius:{px(2)};}}"
@@ -112,21 +167,23 @@ def _qss(s: float, chk: str) -> str:
         f"background:transparent;border:none;"
         f"width:{px(14)};height:{px(14)};"
         f"margin:-{px(5)} 0;border-radius:{px(7)};}}"
-        # sidebar sliders
+        # sidebar sliders – circular handle matching seekbar dot size
         f"QSlider::groove:horizontal{{height:{px(3)};background:#2a2a2a;"
         f"border-radius:{px(1)};}}"
         f"QSlider::handle:horizontal{{background:{_TH};border:none;"
-        f"width:{px(10)};height:{px(10)};margin:-{px(4)} 0;"
-        f"border-radius:{px(5)};}}"
+        f"width:{_dot};height:{_dot};margin:-{_dot_m} 0;"
+        f"border-radius:{_dot_r};}}"
         f"QSlider::handle:horizontal:hover{{background:{_W};}}"
         f"QSlider::sub-page:horizontal{{background:{_T};"
         f"border-radius:{px(1)};}}"
+        # checkboxes
         f"QCheckBox{{spacing:{px(6)};color:{_T};font-size:{px(11)};}}"
         f"QCheckBox::indicator{{width:{px(13)};height:{px(13)};"
-        f"border:1px solid #444;border-radius:{px(3)};background:#1a1a1a;}}"
+        f"border:1px solid #444;border-radius:{_r_sm};background:#1a1a1a;}}"
         f"QCheckBox::indicator:checked{{background:#1a1a1a;"
-        f"border:1px solid #555;border-radius:{px(3)};"
+        f"border:1px solid #555;border-radius:{_r_sm};"
         f"image:url({chk});}}"
+        # video display
         f"#videoDisplay{{background:#000;border:none;color:{_TD};"
         f"font-size:{px(13)};}}"
         f"#overlayCtrl,#overlaySeek,#ctrlBar{{background:transparent;}}"
@@ -134,20 +191,43 @@ def _qss(s: float, chk: str) -> str:
         f"#timeLabel{{color:rgba(255,255,255,0.6);font-size:{px(11)};"
         f"font-family:'Consolas','Courier New',monospace;"
         f"padding:0;margin:0;background:transparent;}}"
-
         f"#vidName{{color:{_T};font-size:{px(11)};padding:0;"
         f"background:transparent;}}"
         f"#sliderLabel{{color:{_TD};font-size:{px(11)};}}"
-        f"QComboBox{{background:transparent;color:{_T};"
-        f"border:1px solid #1a1a1a;border-radius:{px(3)};"
-        f"padding:{px(4)} {px(8)};font-size:{px(11)};"
+        # comboboxes – styled to match the playback-speed QMenu popup
+        f"QComboBox{{background:#161616;color:{_T};"
+        f"border:1px solid {_BD};border-radius:{_r};"
+        f"padding:{px(4)} {px(8)};font-size:{px(10)};"
+        f"font-family:'Consolas','Courier New',monospace;"
         f"min-height:{px(20)};}}"
         f"QComboBox:hover{{border-color:#333;}}"
-        f"QComboBox::drop-down{{border:none;width:{px(20)};}}"
+        f"QComboBox:on{{border-color:#333;}}"
+        f"QComboBox::drop-down{{border:none;width:{px(18)};}}"
         f"QComboBox::down-arrow{{image:none;}}"
-        f"QComboBox QAbstractItemView{{background:#141414;color:{_T};"
-        f"border:1px solid {_BD};selection-background-color:#222;"
-        f"font-size:{px(11)};}}"
+        f"QComboBox QAbstractItemView{{background:#161616;color:{_T};"
+        f"border:1px solid {_BD};border-radius:{_r};"
+        f"selection-background-color:#2a2a2a;"
+        f"selection-color:{_TH};outline:0;"
+        f"font-family:'Consolas','Courier New',monospace;"
+        f"font-size:{px(11)};padding:{px(4)} 0;}}"
+        f"QComboBox QAbstractItemView::viewport{{background:#161616;"
+        f"border-radius:{_r};}}"
+        f"QComboBox QAbstractItemView::item{{"
+        f"padding:{px(4)} {px(10)};min-height:{px(28)};color:{_T};}}"
+        f"QComboBox QAbstractItemView::item:hover{{"
+        f"background:#2a2a2a;color:{_TH};}}"
+        f"QComboBox QAbstractItemView::item:selected{{"
+        f"background:#2a2a2a;color:{_TH};}}"
+        f"QComboBox QAbstractItemView::item:selected:active{{"
+        f"background:#2a2a2a;color:{_TH};}}"
+        f"QComboBox QAbstractItemView::item:selected:!active{{"
+        f"background:#2a2a2a;color:{_TH};}}"
+        f"QFrame#comboPopup{{background:#161616;border:1px solid {_BD};"
+        f"border-radius:{_r};}}"
+        f"QComboBox#modelCombo{{padding:{px(4)} {px(8)};}}"
+        f"QComboBox#modelCombo QAbstractItemView::item{{"
+        f"padding:{px(4)} {px(10)};min-height:{px(28)};color:{_T};}}"
+        # status
         f"#statusLabel{{color:#444;font-size:{px(10)};"
         f"padding:{px(1)} {px(8)};}}"
         f"QScrollArea{{border:none;background:transparent;}}"
@@ -158,6 +238,19 @@ def _qss(s: float, chk: str) -> str:
         f"QScrollBar::handle:vertical:hover{{background:#3a3a3a;}}"
         f"QScrollBar::add-line:vertical,"
         f"QScrollBar::sub-line:vertical{{height:0;}}"
+        f"QScrollBar:horizontal{{height:0;background:transparent;}}"
+        # tooltips
+        f"QToolTip{{background:#1a1a1a;color:{_T};border:1px solid #333;"
+        f"border-radius:{_r};padding:{px(4)} {px(8)};font-size:{px(11)};}}"
+        # colour dot in sidebar (QPushButton overrides)
+        f"#colorDot{{background:transparent;border:none;"
+        f"border-radius:{px(5)};"
+        f"min-width:{px(10)};max-width:{px(10)};"
+        f"min-height:{px(10)};max-height:{px(10)};"
+        f"padding:0;margin:0;}}"
+        f"#colorDot:hover{{border:none;}}"
+        f"#colorDot:pressed{{border:none;}}"
+        f"#colorDot:focus{{border:none;outline:none;}}"
     )
 
 
@@ -167,8 +260,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Safety Gear Compliance")
-        self.setMinimumSize(1440, 750)
-        self.resize(1440, 750)
+        self.setMinimumSize(1024, 600)
+        self.resize(1670, 760)
         self.setAcceptDrops(True)
         self._chk = self._make_checkmark_icon()
         self._state = PipelineState()
@@ -190,6 +283,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._converter: Optional[ConvertWorker] = None
         self._cvt_t0: float = 0.0          # monotonic start time of conversion
         self._cvt_label: str = ""           # last "Converting X → Y" message
+        # model registry state
+        self._model_groups: Dict = {}
+        self._prev_combo_idx: Dict[int, int] = {}
         # heartbeat timer: update status bar every 20 s during long TRT builds
         self._cvt_timer = QtCore.QTimer(self)
         self._cvt_timer.setInterval(20_000)
@@ -242,21 +338,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _to_bgr_tuple(color: QtGui.QColor) -> tuple[int, int, int]:
         return (color.blue(), color.green(), color.red())
 
-    def _set_model_color_btn_style(self, cid: int) -> None:
-        """Apply class colour accent and status text colour for model entry."""
-        lbl = self._mstat[cid]
-        box = self._mfile_box[cid]
-        qcol = self._to_qcolor_bgr(self._state.get_class_color(cid))
-        loaded = lbl.objectName() == "modelFileLoaded"
-        fg = _TH if loaded else _TD
-        box.setStyleSheet(
-            f"QWidget#modelFileBox{{background:transparent;border-radius:0;"
-            f"border-left:2px solid {qcol.name()};}}")
-        lbl.setStyleSheet(
-            f"QLabel{{color:{fg};font-size:{int(11*_S)}px;"
-            f"padding:{int(2*_S)}px {int(6*_S)}px;"
-            "background:transparent;}")
-
     # ── ui ────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -280,7 +361,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setCollapsible(0, False)
-        self._splitter.setSizes([int(230 * _S), int(730 * _S)])
+        self._splitter.setSizes([int(280 * _S), int(640 * _S)])
 
         # top bar
         self._topBar = tb = QtWidgets.QWidget()
@@ -303,6 +384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.videoDisplay = VideoDropLabel(
             _DROP_PROMPT)
         self.videoDisplay.setObjectName("videoDisplay")
+        self.videoDisplay.setAlignment(QtCore.Qt.AlignCenter)
         self.videoDisplay.setMinimumSize(320, 180)
         self.videoDisplay.setScaledContents(False)
         self.videoDisplay.setMouseTracking(True)
@@ -375,14 +457,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnStepFwd = self._ibtn("step-forward", "Next frame")
         self._btnVol = self._ibtn("volume-up", "Volume")
 
-        # speed
-        self._speeds = [("0.25×", .25), ("0.5×", .5), ("1×", 1.),
-                        ("1.5×", 1.5), ("2×", 2.), ("4×", 4.)]
-        self._spd_idx = 2
-        self.btnSpeed = self._ibtn("tachometer-alt", "Playback speed")
+        # speed slider (replaces menu button)
+        self._speeds = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
+        self._spd_idx = 2  # default 1.0×
+        _spd_icon = QtWidgets.QLabel()
+        _spd_isz = int(13 * _S)
+        _spd_icon.setPixmap(_fa("tachometer-alt", _TD, _spd_isz).pixmap(_spd_isz, _spd_isz))
+        _spd_icon.setFixedSize(_spd_isz, _spd_isz)
+        _spd_icon.setStyleSheet("background:transparent;")
+        self.spdSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.spdSlider.setObjectName("speedSlider")
+        self.spdSlider.setRange(0, len(self._speeds) - 1)
+        self.spdSlider.setValue(self._spd_idx)
+        self.spdSlider.setFixedWidth(int(70 * _S))
+        self.spdSlider.setFixedHeight(int(14 * _S))
+        self.spdSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.spdSlider.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.spdLabel = QtWidgets.QLabel("1×")
+        self.spdLabel.setObjectName("timeLabel")
+        self.spdLabel.setFixedWidth(int(28 * _S))
 
-        for w in (self.btnPlay, self.btnStepFwd, self._btnVol, self.btnSpeed):
+        for w in (self.btnPlay, self.btnStepFwd, self._btnVol):
             cr.addWidget(w, 0, AV)
+        cr.addSpacing(int(4 * _S))
+        cr.addWidget(_spd_icon, 0, AV)
+        cr.addSpacing(int(4 * _S))
+        cr.addWidget(self.spdSlider, 0, AV)
+        cr.addWidget(self.spdLabel, 0, AV)
 
         sp = QtWidgets.QWidget(); sp.setFixedWidth(int(8 * _S))
         sp.setStyleSheet("background:transparent;")
@@ -427,8 +528,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_sidebar(self) -> QtWidgets.QWidget:
         sb = QtWidgets.QWidget(); sb.setObjectName("sidebar")
-        sb.setMinimumWidth(int(200 * _S))
-        sb.setMaximumWidth(int(340 * _S))
+        sb.setMinimumWidth(int(180 * _S))
+        sb.setMaximumWidth(int(300 * _S))
         outer = QtWidgets.QVBoxLayout(sb)
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
         scroll = QtWidgets.QScrollArea()
@@ -437,9 +538,11 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         content = QtWidgets.QWidget()
+        content.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         lay = QtWidgets.QVBoxLayout(content)
         lay.setContentsMargins(
-            int(16*_S), int(14*_S), int(16*_S), int(14*_S))
+            int(14*_S), int(14*_S), int(14*_S), int(14*_S))
         lay.setSpacing(int(4 * _S))
 
         hdr = QtWidgets.QLabel("Controls")
@@ -454,6 +557,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnLoadVideo.setText("  Load Video")
         self.btnLoadVideo.setFixedHeight(int(28 * _S))
         self.btnLoadVideo.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnLoadVideo.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         lay.addWidget(self.btnLoadVideo)
 
         self._vfWidget = QtWidgets.QWidget()
@@ -470,6 +575,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lblVidName = QtWidgets.QLabel("")
         self.lblVidName.setObjectName("vidName")
         self.lblVidName.setWordWrap(False)
+        self.lblVidName.setMinimumWidth(0)
+        self.lblVidName.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         vfr.addWidget(self.lblVidName, stretch=1)
         _sq = int(24 * _S)  # square button size
         csz = int(11 * _S)
@@ -490,74 +598,126 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # MODELS
         lay.addWidget(self._section("MODELS"))
-        self._mbtn: Dict[int, QtWidgets.QPushButton] = {}
-        self._mstat: Dict[int, QtWidgets.QLabel] = {}
+
+        self.btnToggleAllModels = QtWidgets.QPushButton("Enable / Disable All")
+        self.btnToggleAllModels.setFixedHeight(int(26 * _S))
+        self.btnToggleAllModels.setFocusPolicy(QtCore.Qt.NoFocus)
+        lay.addWidget(self.btnToggleAllModels)
+
+        fmt_row = QtWidgets.QHBoxLayout()
+        fmt_row.setContentsMargins(0, 0, 0, 0)
+        fmt_row.setSpacing(int(6 * _S))
+        self.btnSetAllPyTorch = QtWidgets.QPushButton("PyTorch")
+        self.btnSetAllTensorRT = QtWidgets.QPushButton("TensorRT")
+        self.btnSetAllOpenVINO = QtWidgets.QPushButton("OpenVINO")
+        for btn in (self.btnSetAllPyTorch, self.btnSetAllTensorRT,
+                    self.btnSetAllOpenVINO):
+            btn.setFixedHeight(int(24 * _S))
+            btn.setFocusPolicy(QtCore.Qt.NoFocus)
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Fixed)
+            fmt_row.addWidget(btn)
+        lay.addLayout(fmt_row)
+        lay.addSpacing(int(4 * _S))
+
         self._mtog: Dict[int, QtWidgets.QCheckBox] = {}
-        self._mfile_box: Dict[int, QtWidgets.QWidget] = {}
-        self._mconv: Dict[int, QtWidgets.QPushButton] = {}  # convert buttons
+        self._mcombo: Dict[int, _AlignedComboBox] = {}
+        self._mconv: Dict[int, QtWidgets.QPushButton] = {}
+        self._mbrowse: Dict[int, QtWidgets.QPushButton] = {}
+        self._mcolor_dot: Dict[int, QtWidgets.QPushButton] = {}
+        self._mfmt_label: Dict[int, QtWidgets.QLabel] = {}  # no-op compat
+
+        _bisz = int(11 * _S)  # small icon size
+        _bsq = int(22 * _S)   # small button square
+
         mcard = QtWidgets.QWidget(); mcard.setObjectName("modelCard")
         ml = QtWidgets.QVBoxLayout(mcard)
         ml.setContentsMargins(0, int(4*_S), 0, int(4*_S))
-        ml.setSpacing(int(5 * _S))
-        bisz = int(11 * _S)
+        ml.setSpacing(int(8 * _S))
+
         for cid in TARGET_CLASS_IDS:
             name = CLASS_NAMES[cid]
-            block = QtWidgets.QWidget()
-            tv = QtWidgets.QVBoxLayout(block)
-            tv.setContentsMargins(0, 0, 0, 0)
-            tv.setSpacing(int(3 * _S))
+
+            # ── row 1: color dot  +  checkbox  +  browse  +  bolt
+            r1 = QtWidgets.QHBoxLayout()
+            r1.setContentsMargins(0, 0, 0, 0)
+            r1.setSpacing(int(6 * _S))
+
+            # clickable colour dot
+            dot = QtWidgets.QPushButton()
+            dot.setObjectName("colorDot")
+            _dsz = int(10 * _S)
+            dot.setFixedSize(_dsz, _dsz)
+            clr = self._to_qcolor_bgr(self._state.get_class_color(cid))
+            dot.setStyleSheet(
+                f"background:{clr.name()};border:none;"
+                f"border-radius:{_dsz // 2}px;"
+                f"min-width:{_dsz}px;max-width:{_dsz}px;"
+                f"min-height:{_dsz}px;max-height:{_dsz}px;")
+            dot.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            dot.setToolTip("Change colour")
+            dot.setFlat(True)
+            dot.setFocusPolicy(QtCore.Qt.NoFocus)
+            self._mcolor_dot[cid] = dot
+            r1.addWidget(dot, 0, QtCore.Qt.AlignVCenter)
+
             chk = QtWidgets.QCheckBox(name)
             chk.setChecked(True)
             self._mtog[cid] = chk
-            tv.addWidget(chk)
-            file_box = QtWidgets.QWidget(); file_box.setObjectName("modelFileBox")
-            self._mfile_box[cid] = file_box
-            fr = QtWidgets.QHBoxLayout(file_box)
-            fr.setContentsMargins(0, 0, 0, 0)
-            fr.setSpacing(0)
-            st = QtWidgets.QLabel("\u2014")
-            st.setObjectName("modelFile")
-            st.setToolTip("Click to change colour")
-            st.setWordWrap(False)
-            st.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-            st.setMinimumHeight(int(22 * _S))
-            st.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            self._mstat[cid] = st
-            fr.addWidget(st, stretch=1)
+            r1.addWidget(chk)
+            r1.addStretch()
 
-            _msq = int(22 * _S)  # square 1:1
-            btn = QtWidgets.QPushButton()
-            btn.setObjectName("modelFileIcon")
-            btn.setIcon(_fa("folder-open", _TD, bisz))
-            btn.setIconSize(QtCore.QSize(bisz, bisz))
-            btn.setFixedSize(_msq, _msq)
-            btn.setToolTip(f"Load {name} model")
-            btn.setFlat(True)
-            btn.setFocusPolicy(QtCore.Qt.NoFocus)
-            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            self._mbtn[cid] = btn
-            fr.addWidget(btn)
+            # browse (folder) button
+            bbrowse = QtWidgets.QPushButton()
+            bbrowse.setObjectName("iconBtn")
+            bbrowse.setIcon(_fa("folder-open", _TD, _bisz))
+            bbrowse.setIconSize(QtCore.QSize(_bisz, _bisz))
+            bbrowse.setFixedSize(_bsq, _bsq)
+            bbrowse.setToolTip(f"Browse for {name} model")
+            bbrowse.setFlat(True)
+            bbrowse.setFocusPolicy(QtCore.Qt.NoFocus)
+            bbrowse.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            self._mbrowse[cid] = bbrowse
+            r1.addWidget(bbrowse, 0, QtCore.Qt.AlignVCenter)
 
-            # convert / optimise button (visible only for .pt models)
+            # convert (bolt) button
             conv = QtWidgets.QPushButton()
-            conv.setObjectName("modelFileIcon")
-            conv.setIcon(_fa("bolt", _TD, bisz))
-            conv.setIconSize(QtCore.QSize(bisz, bisz))
-            conv.setFixedSize(_msq, _msq)
-            conv.setToolTip(f"Optimise {name} model for current device")
+            conv.setObjectName("iconBtn")
+            conv.setIcon(_fa("bolt", _TD, _bisz))
+            conv.setIconSize(QtCore.QSize(_bisz, _bisz))
+            conv.setFixedSize(_bsq, _bsq)
+            conv.setToolTip(f"Optimise {name} model")
             conv.setFlat(True)
             conv.setFocusPolicy(QtCore.Qt.NoFocus)
             conv.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             conv.setVisible(False)
             self._mconv[cid] = conv
-            fr.addWidget(conv)
+            r1.addWidget(conv, 0, QtCore.Qt.AlignVCenter)
 
-            self._set_model_color_btn_style(cid)
-            tv.addWidget(file_box)
-            ml.addWidget(block)
+            ml.addLayout(r1)
+
+            # ── row 2: model selector combo
+            combo = _AlignedComboBox()
+            combo.setObjectName("modelCombo")
+            combo.setMinimumHeight(int(24 * _S))
+            combo.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Fixed)
+            combo.view().setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarAlwaysOff)
+            combo.view().setTextElideMode(QtCore.Qt.ElideRight)
+            combo.view().setSelectionMode(
+                QtWidgets.QAbstractItemView.SingleSelection)
+            combo.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(0)
+            self._mcombo[cid] = combo
+            ml.addWidget(combo)
+
         lay.addWidget(mcard)
 
-        # "Optimize All" button – converts every loaded .pt model
+        # Optimize All button
         self.btnOptimizeAll = QtWidgets.QPushButton()
         _oisz = int(13 * _S)
         self.btnOptimizeAll.setIcon(_fa("bolt", _T, _oisz))
@@ -565,6 +725,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnOptimizeAll.setText("  Optimize All Models")
         self.btnOptimizeAll.setFixedHeight(int(28 * _S))
         self.btnOptimizeAll.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnOptimizeAll.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.btnOptimizeAll.setVisible(False)
         lay.addWidget(self.btnOptimizeAll)
 
@@ -576,10 +738,6 @@ class MainWindow(QtWidgets.QMainWindow):
         dl = QtWidgets.QVBoxLayout(dcard)
         dl.setContentsMargins(0, int(4*_S), 0, int(4*_S))
         dl.setSpacing(int(5 * _S))
-
-        self.chkOverlay = QtWidgets.QCheckBox("Show overlays")
-        self.chkOverlay.setChecked(True)
-        dl.addWidget(self.chkOverlay)
 
         for attr, label, default in [("conf", "Confidence", 25),
                                      ("iou", "IoU", 45)]:
@@ -594,7 +752,8 @@ class MainWindow(QtWidgets.QMainWindow):
             slider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             val = QtWidgets.QLabel(f"{default / 100:.2f}")
             val.setObjectName("sliderLabel")
-            val.setFixedWidth(int(32 * _S))
+            val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            val.setFixedWidth(int(28 * _S))
             r.addWidget(slider, stretch=1); r.addWidget(val)
             dl.addLayout(r)
             setattr(self, f"{attr}Slider", slider)
@@ -603,7 +762,10 @@ class MainWindow(QtWidgets.QMainWindow):
         perf_lbl = QtWidgets.QLabel("Inference Size")
         perf_lbl.setObjectName("sliderLabel")
         dl.addWidget(perf_lbl)
-        self.imgszCombo = QtWidgets.QComboBox()
+        self.imgszCombo = _AlignedComboBox()
+        self.imgszCombo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.imgszCombo.setMinimumContentsLength(0)
         for size in (256, 320, 480, 640, 960, 1280):
             self.imgszCombo.addItem(str(size), size)
         self.imgszCombo.setCurrentText("256")
@@ -612,7 +774,10 @@ class MainWindow(QtWidgets.QMainWindow):
         dev_lbl = QtWidgets.QLabel("Device")
         dev_lbl.setObjectName("sliderLabel")
         dl.addWidget(dev_lbl)
-        self.deviceCombo = QtWidgets.QComboBox()
+        self.deviceCombo = _AlignedComboBox()
+        self.deviceCombo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.deviceCombo.setMinimumContentsLength(0)
         self.deviceCombo.addItem("Auto", "auto")
         self.deviceCombo.addItem("GPU (CUDA)", "cuda")
         self.deviceCombo.addItem("CPU", "cpu")
@@ -634,7 +799,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.strideSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.strideLabel = QtWidgets.QLabel("1")
         self.strideLabel.setObjectName("sliderLabel")
-        self.strideLabel.setFixedWidth(int(20 * _S))
+        self.strideLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.strideLabel.setFixedWidth(int(16 * _S))
         sr.addWidget(self.strideSlider, stretch=1)
         sr.addWidget(self.strideLabel)
         dl.addLayout(sr)
@@ -643,6 +809,31 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addStretch()
         scroll.setWidget(content); outer.addWidget(scroll)
         return sb
+
+    def _update_model_format_labels(self) -> None:
+        """Update sidebar format labels from current combo selections."""
+        for cid in TARGET_CLASS_IDS:
+            lbl = self._mfmt_label.get(cid)
+            if not lbl:
+                continue
+            combo = self._mcombo.get(cid)
+            if not combo:
+                lbl.setText("\u2014")
+                continue
+            data = combo.currentData()
+            if not data:
+                lbl.setText("\u2014")
+            elif data.get("type") == "auto":
+                path = self._state.model_paths.get(cid)
+                if path:
+                    fmt = _detect_format(path)
+                    lbl.setText(
+                        _FORMAT_LABEL.get(fmt, "Auto") if fmt else "Auto")
+                else:
+                    lbl.setText("\u2014")
+            else:
+                fmt = data.get("format", "")
+                lbl.setText(_FORMAT_LABEL.get(fmt, fmt.upper()))
 
     # ── overlay positioning ───────────────────────────────────────────────
 
@@ -662,7 +853,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._repos()
             if not self._last_pixmap.isNull():
                 self.videoDisplay.setPixmap(self._last_pixmap.scaled(
-                    self.videoDisplay.size(), QtCore.Qt.IgnoreAspectRatio,
+                    self.videoDisplay.size(), QtCore.Qt.KeepAspectRatio,
                     QtCore.Qt.FastTransformation))
         # fullscreen: mouse movement on video/overlay → show controls
         if self._is_fs and etype == QtCore.QEvent.MouseMove:
@@ -785,12 +976,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _connect_signals(self) -> None:
         self.btnLoadVideo.clicked.connect(self._on_load_video)
         self.btnCloseVid.clicked.connect(self._on_close_video)
-        for cid, btn in self._mbtn.items():
-            btn.clicked.connect(
-                lambda _=False, c=cid: self._on_load_model(c))
+        for cid, combo in self._mcombo.items():
+            combo.currentIndexChanged.connect(
+                lambda idx, c=cid: self._on_model_combo_changed(c))
         for cid, conv in self._mconv.items():
             conv.clicked.connect(
                 lambda _=False, c=cid: self._on_convert_model(c))
+        for cid, bb in self._mbrowse.items():
+            bb.clicked.connect(
+                lambda _=False, c=cid: self._on_browse_model(c))
+        for cid, dot in self._mcolor_dot.items():
+            dot.clicked.connect(
+                lambda _=False, c=cid: self._on_pick_model_color(c))
         self.btnOptimizeAll.clicked.connect(self._on_convert_all)
         self.videoDisplay.filesDropped.connect(self._on_files_dropped)
         self.btnPlay.clicked.connect(self._on_play_pause)
@@ -803,15 +1000,17 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: setattr(self, "_user_seeking", True))
         self.seekSlider.sliderReleased.connect(self._on_seek_released)
         self.seekSlider.sliderMoved.connect(self._on_seek_moved)
-        self.btnSpeed.clicked.connect(self._show_speed_menu)
-        self.chkOverlay.toggled.connect(self._state.set_overlay_enabled)
+        self.spdSlider.valueChanged.connect(self._on_speed_changed)
+        self.btnToggleAllModels.clicked.connect(self._on_toggle_all_models)
+        self.btnSetAllPyTorch.clicked.connect(
+            lambda: self._set_all_models_format("pt", "PyTorch"))
+        self.btnSetAllTensorRT.clicked.connect(
+            lambda: self._set_all_models_format("engine", "TensorRT"))
+        self.btnSetAllOpenVINO.clicked.connect(
+            lambda: self._set_all_models_format("openvino", "OpenVINO"))
         for cid, chk in self._mtog.items():
             chk.toggled.connect(
                 lambda v, c=cid: self._state.set_model_enabled(c, v))
-        for cid, lbl in self._mstat.items():
-            lbl.mousePressEvent = (
-                lambda ev, c=cid: self._on_pick_model_color(c)
-                if ev.button() == QtCore.Qt.LeftButton else None)
         self.confSlider.valueChanged.connect(self._on_conf)
         self.iouSlider.valueChanged.connect(self._on_iou)
         self.imgszCombo.currentIndexChanged.connect(self._on_imgsz_changed)
@@ -829,7 +1028,55 @@ class MainWindow(QtWidgets.QMainWindow):
         if not picked.isValid():
             return
         self._state.set_class_color(cid, self._to_bgr_tuple(picked))
-        self._set_model_color_btn_style(cid)
+        # update sidebar colour dot
+        dot = self._mcolor_dot.get(cid)
+        if dot:
+            _dsz = int(10 * _S)
+            dot.setStyleSheet(
+                f"background:{picked.name()};border:none;"
+                f"border-radius:{_dsz // 2}px;"
+                f"min-width:{_dsz}px;max-width:{_dsz}px;"
+                f"min-height:{_dsz}px;max-height:{_dsz}px;")
+
+    def _on_toggle_all_models(self) -> None:
+        """Toggle all model-class checkboxes on/off together."""
+        if not self._mtog:
+            return
+        all_enabled = all(chk.isChecked() for chk in self._mtog.values())
+        target = not all_enabled
+        for chk in self._mtog.values():
+            chk.setChecked(target)
+        self._set_status(
+            "All model classes enabled" if target
+            else "All model classes disabled")
+
+    def _set_all_models_format(self, fmt: str, label: str) -> None:
+        """Set every model combobox to the requested runtime format."""
+        missing = []
+        changed = 0
+        for cid in TARGET_CLASS_IDS:
+            combo = self._mcombo.get(cid)
+            if combo is None:
+                continue
+            target_idx = -1
+            for idx in range(combo.count()):
+                data = combo.itemData(idx) or {}
+                if data.get("type") in ("variant", "custom") and data.get("format") == fmt:
+                    target_idx = idx
+                    break
+            if target_idx >= 0:
+                if combo.currentIndex() != target_idx:
+                    combo.setCurrentIndex(target_idx)
+                    changed += 1
+            else:
+                missing.append(CLASS_NAMES.get(cid, str(cid)))
+
+        if missing:
+            self._set_status(
+                f"Set {label} where available ({changed} changed). "
+                f"Missing: {', '.join(missing)}")
+        else:
+            self._set_status(f"Set all models to {label}")
 
     def _step_forward(self) -> None:
         if self._state.video_path:
@@ -838,11 +1085,12 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── auto-load models ──────────────────────────────────────────────────
 
     def _auto_load_models(self) -> None:
-        d = os.path.join(_ROOT, "models"); loaded = []
-        for cid, fn in DEFAULT_MODEL_FILES.items():
-            p = os.path.join(d, fn)
-            if os.path.isfile(p):
-                self._set_model(cid, p)
+        self._model_groups = discover_models()
+        loaded = []
+        for cid in TARGET_CLASS_IDS:
+            self._populate_model_combo(cid)
+            group = self._model_groups.get(cid)
+            if group and group.variants:
                 loaded.append(CLASS_NAMES[cid])
         use_cuda = torch.cuda.is_available()
         default_imgsz = 320 if use_cuda else 256
@@ -861,6 +1109,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Auto-loaded: {', '.join(loaded)}" if loaded
             else "No default models found \u2014 load via sidebar")
         self._update_convert_buttons()
+        self._update_model_format_labels()
 
     # ── video / model loading ─────────────────────────────────────────────
 
@@ -873,26 +1122,146 @@ class MainWindow(QtWidgets.QMainWindow):
         if p:
             self._open_video(p)
 
-    def _on_load_model(self, cid: int) -> None:
+    # ── model selector helpers ────────────────────────────────────────────
+
+    def _get_effective_device(self) -> str:
+        """Return 'cuda' or 'cpu' based on current combo selection."""
+        raw = str(self.deviceCombo.currentData() or "auto").lower()
+        if raw == "cpu":
+            return "cpu"
+        if raw in ("cuda", "auto") and torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+
+    def _populate_model_combo(self, cid: int) -> None:
+        """Fill a model combobox with Auto + discovered variants only."""
+        combo = self._mcombo[cid]
+        combo.blockSignals(True)
+        combo.clear()
+
+        combo.addItem("Auto (best for device)", {"type": "auto"})
+
+        group = self._model_groups.get(cid)
+        if group and group.variants:
+            for v in group.variants:
+                combo.addItem(v.display_name, {
+                    "type": "variant", "path": v.path, "format": v.format,
+                })
+
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+        self._prev_combo_idx[cid] = 0
+        self._resolve_auto_model(cid)
+
+    def _resolve_auto_model(self, cid: int) -> None:
+        """Resolve the 'Auto' selection to the best variant for the device."""
+        group = self._model_groups.get(cid)
+        combo = self._mcombo[cid]
+        if not group or not group.variants:
+            self._state.model_paths[cid] = None
+            combo.setToolTip("No models found")
+            return
+        device = self._get_effective_device()
+        variant = group.best_for_device(device)
+        if variant:
+            self._state.model_paths[cid] = variant.path
+            combo.setToolTip(f"Using: {variant.display_name}")
+        else:
+            self._state.model_paths[cid] = None
+            combo.setToolTip("No compatible model for current device")
+
+    def _on_model_combo_changed(self, cid: int) -> None:
+        """Handle model combobox selection change."""
+        combo = self._mcombo[cid]
+        data = combo.currentData()
+        if not data:
+            return
+
+        kind = data.get("type")
+
+        if kind == "auto":
+            self._resolve_auto_model(cid)
+            self._prev_combo_idx[cid] = combo.currentIndex()
+            self._update_convert_buttons()
+            self._update_model_format_labels()
+
+        elif kind in ("variant", "custom"):
+            self._state.model_paths[cid] = data["path"]
+            combo.setToolTip(data["path"])
+            self._prev_combo_idx[cid] = combo.currentIndex()
+            self._update_convert_buttons()
+            self._update_model_format_labels()
+
+    def _on_browse_model(self, cid: int) -> None:
+        """Open a file/folder dialog for browsing a model."""
+        from utils.model_registry import MODELS_DIR
+        start_dir = MODELS_DIR if os.path.isdir(MODELS_DIR) else ""
+        name = CLASS_NAMES.get(cid, "")
+        # Try file first
         p, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, f"Load {CLASS_NAMES.get(cid, str(cid))} Model", "",
-            "Model Files (*.pt *.engine *.onnx);;All (*)")
+            self, f"Load {name} Model", start_dir,
+            "Model Files (*.pt *.engine *.onnx);;OpenVINO (*.xml);;All (*)")
         if p:
-            self._set_model(cid, p)
+            # If user picked an .xml inside an openvino dir, use the parent dir
+            if p.endswith(".xml"):
+                parent = os.path.dirname(p)
+                if _detect_format(parent) == "openvino":
+                    p = parent
+            self._add_custom_model(cid, p)
+            return
+
+    def _add_custom_model(self, cid: int, path: str) -> None:
+        """Add a user-browsed model to the combobox and select it."""
+        fmt = _detect_format(path)
+        if not fmt:
+            QtWidgets.QMessageBox.warning(
+                self, "Unsupported Format",
+                f"Cannot detect model format:\n{path}")
+            return
+        label = f"{os.path.basename(path)}  ({_FORMAT_LABEL.get(fmt, fmt)})"
+        combo = self._mcombo[cid]
+        combo.blockSignals(True)
+        # Append at end
+        insert_idx = combo.count()
+        combo.insertItem(insert_idx, label, {
+            "type": "custom", "path": path, "format": fmt,
+        })
+        combo.setCurrentIndex(insert_idx)
+        combo.blockSignals(False)
+        self._state.model_paths[cid] = path
+        combo.setToolTip(path)
+        self._prev_combo_idx[cid] = insert_idx
+        self._update_convert_buttons()
+        self._update_model_format_labels()
+
+    def _refresh_model_combos(self) -> None:
+        """Re-discover models and repopulate all comboboxes."""
+        self._model_groups = discover_models()
+        for cid in TARGET_CLASS_IDS:
+            combo = self._mcombo[cid]
+            old_data = combo.currentData() or {}
+            was_auto = old_data.get("type") == "auto"
+            old_path = old_data.get("path")
+
+            self._populate_model_combo(cid)
+
+            if not was_auto and old_path:
+                # Re-select the same variant if still available
+                for i in range(combo.count()):
+                    d = combo.itemData(i) or {}
+                    if d.get("path") == old_path:
+                        combo.blockSignals(True)
+                        combo.setCurrentIndex(i)
+                        combo.blockSignals(False)
+                        self._state.model_paths[cid] = old_path
+                        self._prev_combo_idx[cid] = i
+                        break
+        self._update_model_format_labels()
 
     def _set_model(self, cid: int, path: str) -> None:
-        self._state.model_paths[cid] = path
-        st = self._mstat[cid]
-        base = os.path.basename(path)
-        fm = st.fontMetrics()
-        text_w = max(20, (st.width() if st.width() > 0 else int(120 * _S))
-                     - int(12 * _S))
-        st.setText(fm.elidedText(base, QtCore.Qt.ElideMiddle, text_w))
-        st.setObjectName("modelFileLoaded")
-        st.style().unpolish(st); st.style().polish(st)
-        st.setToolTip(path)
-        self._set_model_color_btn_style(cid)
-        self._update_convert_buttons()
+        """Programmatic model set (e.g. from drag-and-drop)."""
+        self._add_custom_model(cid, path)
 
     def _on_files_dropped(self, paths: list) -> None:
         unknown: list[str] = []
@@ -903,7 +1272,13 @@ class MainWindow(QtWidgets.QMainWindow):
             elif ext in MODEL_EXTENSIONS:
                 cid = self._infer_class(p)
                 if cid is not None:
-                    self._set_model(cid, p)
+                    self._add_custom_model(cid, p)
+                else:
+                    unknown.append(os.path.basename(p))
+            elif os.path.isdir(p) and _detect_format(p) == "openvino":
+                cid = self._infer_class(p)
+                if cid is not None:
+                    self._add_custom_model(cid, p)
                 else:
                     unknown.append(os.path.basename(p))
             else:
@@ -1068,7 +1443,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtGui.QImage(rgb.data, w, h, c * w,
                          QtGui.QImage.Format_RGB888))
         self.videoDisplay.setPixmap(self._last_pixmap.scaled(
-            self.videoDisplay.size(), QtCore.Qt.IgnoreAspectRatio,
+            self.videoDisplay.size(), QtCore.Qt.KeepAspectRatio,
             QtCore.Qt.FastTransformation))
 
     # ── callbacks ─────────────────────────────────────────────────────────
@@ -1119,7 +1494,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_device_changed(self) -> None:
         device = str(self.deviceCombo.currentData() or "auto")
         self._state.set_device(device)
+        # Re-resolve auto models for the new device
+        for cid in TARGET_CLASS_IDS:
+            combo = self._mcombo[cid]
+            data = combo.currentData()
+            if data and data.get("type") == "auto":
+                self._resolve_auto_model(cid)
         self._update_convert_buttons()
+        self._update_model_format_labels()
         self._set_status(f"Device set to {device.upper()} (takes effect on next start)")
 
     def _on_fp16_toggled(self, enabled: bool) -> None:
@@ -1136,121 +1518,87 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _get_current_device_key(self) -> str:
         """Return 'cuda' or 'cpu' based on current combo box selection."""
-        raw = str(self.deviceCombo.currentData() or "auto").lower()
-        if raw == "cpu":
-            return "cpu"
-        if raw in ("cuda", "auto") and torch.cuda.is_available():
-            return "cuda"
-        return "cpu"
-
-    def _optimized_exists_for(self, cid: int, dev: str) -> bool:
-        """Check whether an optimised model exists for *cid* + specific *dev*."""
-        path = self._state.model_paths.get(cid)
-        if not path or not path.lower().endswith(".pt"):
-            return False
-        basename = os.path.splitext(os.path.basename(path))[0]
-        if dev == "cuda":
-            return (
-                os.path.isfile(os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.engine"))
-                or os.path.isfile(os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.onnx"))
-            )
-        else:
-            return (
-                os.path.isdir(os.path.join(OPTIMIZED_CPU_DIR, f"{basename}_openvino_model"))
-                or os.path.isfile(os.path.join(OPTIMIZED_CPU_DIR, f"{basename}.onnx"))
-            )
-
-    def _optimized_exists(self, cid: int) -> bool:
-        """Check whether an optimised model exists for *cid* + current device."""
-        return self._optimized_exists_for(cid, self._get_current_device_key())
+        return self._get_effective_device()
 
     def _update_convert_buttons(self) -> None:
         """Show / hide per-model convert buttons and the Optimize-All button."""
         rt = _detect_runtimes()
         has_cuda = torch.cuda.is_available()
 
-        # Build a combined tooltip string for what will be converted
-        parts = []
-        if has_cuda and rt.best_gpu_format != "pt":
-            ver = rt.tensorrt_ver if rt.best_gpu_format == "engine" else rt.onnx_ver
-            tag = {"engine": "TensorRT", "onnx": "ONNX"}.get(rt.best_gpu_format, rt.best_gpu_format.upper())
-            parts.append(f"GPU → {tag} {ver}".strip())
-        if rt.best_cpu_format != "pt":
-            ver = rt.openvino_ver if rt.best_cpu_format == "openvino" else rt.onnx_ver
-            tag = {"openvino": "OpenVINO", "onnx": "ONNX"}.get(rt.best_cpu_format, rt.best_cpu_format.upper())
-            parts.append(f"CPU → {tag} {ver}".strip())
-        convert_tip = "Convert: " + " + ".join(parts) if parts else ""
-
         any_eligible = False
         for cid in TARGET_CLASS_IDS:
-            path = self._state.model_paths.get(cid)
-            is_pt = bool(path and path.lower().endswith(".pt"))
+            group = self._model_groups.get(cid)
+            btn = self._mconv[cid]
 
-            if not is_pt:
-                self._mconv[cid].setVisible(False)
+            if not group or not group.has_pt:
+                btn.setVisible(False)
                 continue
 
-            # Per-device existence checks
-            gpu_done = (not has_cuda) or self._optimized_exists_for(cid, "cuda")
-            cpu_done = self._optimized_exists_for(cid, "cpu")
+            # Check what optimised formats already exist
+            gpu_done = (
+                (not has_cuda)
+                or (rt.best_gpu_format == "pt")
+                or bool(group.get_variant(rt.best_gpu_format))
+            )
+            cpu_done = (
+                (rt.best_cpu_format == "pt")
+                or bool(group.get_variant(rt.best_cpu_format))
+            )
             all_done = gpu_done and cpu_done
-            no_runtime = not parts  # no useful format for any device
+            no_runtime = (rt.best_gpu_format == "pt" and rt.best_cpu_format == "pt")
 
-            btn = self._mconv[cid]
             if all_done:
-                # Both devices optimised — green check
-                gpu_fmt = {"engine": "TRT", "onnx": "ONNX"}.get(rt.best_gpu_format, "")
-                cpu_fmt = {"openvino": "OV",  "onnx": "ONNX"}.get(rt.best_cpu_format, "")
-                check_tip = " + ".join(filter(None, [
-                    (f"GPU:{gpu_fmt}" if has_cuda else ""),
-                    f"CPU:{cpu_fmt}",
-                ]))
                 btn.setVisible(True)
                 btn.setEnabled(False)
                 btn.setIcon(_fa("check-circle", "#4CAF50", int(11 * _S)))
-                btn.setToolTip(f"Fully optimised ({check_tip})")
+                btn.setToolTip("Fully optimised")
             elif no_runtime:
                 btn.setVisible(True)
                 btn.setEnabled(False)
                 btn.setIcon(_fa("exclamation-triangle", "#888", int(11 * _S)))
                 btn.setToolTip("No optimisation runtime installed (tensorrt / openvino)")
             else:
-                # At least one device still needs conversion
                 missing = []
                 if has_cuda and not gpu_done:
                     missing.append("GPU")
                 if not cpu_done:
                     missing.append("CPU")
-                pending_tip = convert_tip + (f" [{', '.join(missing)} pending]" if missing else "")
                 btn.setVisible(True)
                 btn.setEnabled(True)
                 btn.setIcon(_fa("bolt", _TD, int(11 * _S)))
-                btn.setToolTip(pending_tip)
+                btn.setToolTip(f"Optimise for {', '.join(missing)}")
                 any_eligible = True
 
         self.btnOptimizeAll.setVisible(any_eligible)
 
     def _build_convert_jobs(self, cids=None):
-        """Return a list of ConvertJob tuples for eligible models.
-
-        Always queues jobs for BOTH devices so one click optimises for
-        GPU (TensorRT) AND CPU (OpenVINO) simultaneously.
-        """
+        """Return a list of ConvertJob tuples for eligible models."""
+        rt = _detect_runtimes()
         if cids is None:
             cids = TARGET_CLASS_IDS
         imgsz = self._state.get_imgsz()
-        # Always convert for both targets; skip devices that have no useful format
-        devices = ["cuda", "cpu"] if torch.cuda.is_available() else ["cpu"]
+        has_cuda = torch.cuda.is_available()
         jobs = []
-        for dev in devices:
-            half = self._state.use_fp16() and dev == "cuda"
-            for cid in cids:
-                path = self._state.model_paths.get(cid)
-                if not path or not path.lower().endswith(".pt"):
-                    continue
-                if self._optimized_exists_for(cid, dev):
-                    continue
-                jobs.append((cid, path, dev, imgsz, half))
+
+        for cid in cids:
+            group = self._model_groups.get(cid)
+            if not group or not group.has_pt:
+                continue
+            pt_variant = group.get_variant("pt")
+            if not pt_variant:
+                continue
+
+            # GPU job
+            if has_cuda and rt.best_gpu_format != "pt":
+                if not group.get_variant(rt.best_gpu_format):
+                    half = self._state.use_fp16()
+                    jobs.append((cid, pt_variant.path, "cuda", imgsz, half))
+
+            # CPU job
+            if rt.best_cpu_format != "pt":
+                if not group.get_variant(rt.best_cpu_format):
+                    jobs.append((cid, pt_variant.path, "cpu", imgsz, False))
+
         return jobs
 
     def _on_convert_model(self, cid: int) -> None:
@@ -1353,6 +1701,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_cvt_all_done(self) -> None:
         """All jobs finished — refresh buttons and trigger model hot-reload."""
         self._cvt_timer.stop()
+        # Re-discover models (new optimised variants now exist)
+        self._refresh_model_combos()
         self._update_convert_buttons()
         for cid in TARGET_CLASS_IDS:
             self._mconv[cid].setEnabled(True)
@@ -1362,25 +1712,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status("Model optimisation complete — inference will reload")
 
     def _show_speed_menu(self) -> None:
-        menu = QtWidgets.QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu{{background:#161616;color:{_T};
-                border:1px solid {_BD};padding:{int(4*_S)}px 0;}}
-            QMenu::item{{padding:{int(5*_S)}px {int(20*_S)}px;
-                font-size:{int(11*_S)}px;
-                font-family:"Consolas","Courier New",monospace;}}
-            QMenu::item:selected{{background:#2a2a2a;}}""")
-        for i, (label, rate) in enumerate(self._speeds):
-            act = menu.addAction(label); act.setData((i, rate))
-            if i == self._spd_idx:
-                act.setCheckable(True); act.setChecked(True)
-        pos = self.btnSpeed.mapToGlobal(QtCore.QPoint(0, 0))
-        pos.setY(pos.y() - menu.sizeHint().height())
-        chosen = menu.exec_(pos)
-        if chosen:
-            i, r = chosen.data()
-            self._spd_idx = i
-            self._state.set_playback_rate(float(r))
+        pass  # replaced by spdSlider – kept so old references don't crash
+
+    def _on_speed_changed(self, idx: int) -> None:
+        self._spd_idx = idx
+        rate = self._speeds[idx]
+        label = f"{rate:g}×"
+        self.spdLabel.setText(label)
+        self._state.set_playback_rate(rate)
 
     # ── helpers ───────────────────────────────────────────────────────────
 
