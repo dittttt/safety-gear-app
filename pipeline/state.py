@@ -98,12 +98,30 @@ class PipelineState:
         # ── Model paths ──
         self.model_paths: Dict[int, Optional[str]] = {cid: None for cid in TARGET_CLASS_IDS}
 
+        # ── Model reload flag (set by GUI after optimised-model conversion) ──
+        self.reload_models_flag: bool = False
+
         # ── Video metadata (written by grabber, read by GUI) ──
         self.video_fps: float = 0.0
         self.total_frames: int = 0
         self.video_path: Optional[str] = None
 
     # ── Queue helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def put_safe(q: queue.Queue, item: object) -> None:
+        """Non-blocking put: drop oldest item if *q* is full."""
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                pass
 
     def flush_queues(self) -> None:
         """Drain all three queues (non-blocking)."""

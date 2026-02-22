@@ -7,7 +7,6 @@ and produces annotated ``DisplayPacket`` frames for the GUI.
 """
 
 from typing import Dict, List, Optional, Set, Tuple
-import queue
 
 import cv2
 import numpy as np
@@ -122,17 +121,7 @@ class TrackerLogicThread(QtCore.QThread):
                     stats=last_stats,
                     timestamp_ms=packet.timestamp_ms,
                 )
-                try:
-                    state.display_queue.put_nowait(disp)
-                except queue.Full:
-                    try:
-                        state.display_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        state.display_queue.put_nowait(disp)
-                    except queue.Full:
-                        pass
+                state.put_safe(state.display_queue, disp)
                 continue
 
             # ── Separate by class ──────────────────────────────────────────
@@ -303,17 +292,7 @@ class TrackerLogicThread(QtCore.QThread):
                 timestamp_ms=packet.timestamp_ms,
             )
 
-            try:
-                state.display_queue.put_nowait(disp)
-            except queue.Full:
-                try:
-                    state.display_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    state.display_queue.put_nowait(disp)
-                except queue.Full:
-                    pass
+            state.put_safe(state.display_queue, disp)
 
 
 # ── Drawing utility ────────────────────────────────────────────────────────────

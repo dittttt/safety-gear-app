@@ -5,8 +5,11 @@ All class IDs, colour palettes, queue sizes, and default thresholds live here
 so every module imports from one place.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Tuple
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ── Class IDs ──────────────────────────────────────────────────────────────────
 CLASS_MOTORCYCLE = 0
@@ -78,3 +81,8 @@ DEFAULT_MODEL_FILES: Dict[int, str] = {
     CLASS_FOOTWEAR: "footwear.pt",
     CLASS_IMPROPER_FOOTWEAR: "improper_footwear.pt",
 }
+
+# ── Optimised model directories ───────────────────────────────────────────────
+OPTIMIZED_DIR     = os.path.join(_ROOT, "models", "optimized")
+OPTIMIZED_GPU_DIR = os.path.join(OPTIMIZED_DIR, "GPU")
+OPTIMIZED_CPU_DIR = os.path.join(OPTIMIZED_DIR, "CPU")

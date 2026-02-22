@@ -1,0 +1,34 @@
+18:46:31 INFO ConvertWorker starting — 2 job(s)
+18:46:31 INFO [1/2] Job start: cid=0  file=motorcycle.pt  device=cuda  fmt=engine
+18:46:31 INFO [1/2] Exporting motorcycle → ENGINE (imgsz=320) — TensorRT build takes 3-8 min, please wait…
+18:50:43 INFO Export OK in 251.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\GPU\motorcycle.engine
+18:50:43 INFO [2/2] Job start: cid=0  file=motorcycle.pt  device=cpu  fmt=openvino
+18:50:43 INFO [2/2] Exporting motorcycle → OPENVINO (imgsz=320)
+18:50:52 INFO Export OK in 9.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\CPU\motorcycle_openvino_model
+18:55:05 INFO ConvertWorker starting — 2 job(s)
+18:55:05 INFO [1/2] Job start: cid=1  file=rider.pt  device=cuda  fmt=engine
+18:55:05 INFO [1/2] Exporting rider → ENGINE (imgsz=320) — TensorRT build takes 3-8 min, please wait…
+18:59:16 INFO Export OK in 251.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\GPU\rider.engine
+18:59:16 INFO [2/2] Job start: cid=1  file=rider.pt  device=cpu  fmt=openvino
+18:59:16 INFO [2/2] Exporting rider → OPENVINO (imgsz=320)
+18:59:23 INFO Export OK in 7.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\CPU\rider_openvino_model
+19:01:15 INFO ConvertWorker starting — 2 job(s)
+19:01:15 INFO [1/2] Job start: cid=2  file=helmet.pt  device=cuda  fmt=engine
+19:01:15 INFO [1/2] Exporting helmet → ENGINE (imgsz=320) — TensorRT build takes 3-8 min, please wait…
+19:05:23 INFO Export OK in 247.8s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\GPU\helmet.engine
+19:05:23 INFO [2/2] Job start: cid=2  file=helmet.pt  device=cpu  fmt=openvino
+19:05:23 INFO [2/2] Exporting helmet → OPENVINO (imgsz=320)
+19:05:30 INFO Export OK in 7.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\CPU\helmet_openvino_model
+19:06:21 INFO ConvertWorker starting — 4 job(s)
+19:06:21 INFO [1/4] Job start: cid=3  file=footwear.pt  device=cuda  fmt=engine
+19:06:21 INFO [1/4] Exporting footwear → ENGINE (imgsz=320) — TensorRT build takes 3-8 min, please wait…
+19:10:37 INFO Export OK in 256.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\GPU\footwear.engine
+19:10:37 INFO [2/4] Job start: cid=4  file=improper_footwear.pt  device=cuda  fmt=engine
+19:10:37 INFO [2/4] Exporting improper_footwear → ENGINE (imgsz=320) — TensorRT build takes 3-8 min, please wait…
+19:14:57 INFO Export OK in 259.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\GPU\improper_footwear.engine
+19:14:57 INFO [3/4] Job start: cid=3  file=footwear.pt  device=cpu  fmt=openvino
+19:14:57 INFO [3/4] Exporting footwear → OPENVINO (imgsz=320)
+19:15:05 INFO Export OK in 7.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\CPU\footwear_openvino_model
+19:15:05 INFO [4/4] Job start: cid=4  file=improper_footwear.pt  device=cpu  fmt=openvino
+19:15:05 INFO [4/4] Exporting improper_footwear → OPENVINO (imgsz=320)
+19:15:12 INFO Export OK in 6.8s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\CPU\improper_footwear_openvino_model

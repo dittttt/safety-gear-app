@@ -19,7 +19,10 @@ from PyQt5 import QtCore
 from ultralytics import YOLO
 import torch
 
-from config import TARGET_CLASS_IDS, CLASS_NAMES
+from config import (
+    TARGET_CLASS_IDS, CLASS_NAMES,
+    OPTIMIZED_GPU_DIR, OPTIMIZED_CPU_DIR,
+)
 from pipeline.state import PipelineState, Detection, DetectionPacket
 
 
@@ -46,6 +49,36 @@ class InferenceThread(QtCore.QThread):
 
     # ── Model management ───────────────────────────────────────────────────────
 
+    def _resolve_optimized_path(self, original_path: str) -> str:
+        """Return the best optimised model path for the current device, else *original_path*.
+
+        GPU preference: .engine  > .onnx (CUDA)  > .pt
+        CPU preference: _openvino_model/  > .onnx  > .pt
+        """
+        if not original_path or not original_path.lower().endswith(".pt"):
+            return original_path
+        basename = os.path.splitext(os.path.basename(original_path))[0]
+        is_gpu = self._device.startswith("cuda")
+        if is_gpu:
+            # Best: TensorRT engine
+            engine = os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.engine")
+            if os.path.isfile(engine):
+                return engine
+            # Fallback: ONNX (runs on CUDAExecutionProvider)
+            onnx = os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.onnx")
+            if os.path.isfile(onnx):
+                return onnx
+        else:
+            # Best: OpenVINO IR directory
+            ov_dir = os.path.join(OPTIMIZED_CPU_DIR, f"{basename}_openvino_model")
+            if os.path.isdir(ov_dir):
+                return ov_dir
+            # Fallback: ONNX (runs on CPUExecutionProvider)
+            onnx = os.path.join(OPTIMIZED_CPU_DIR, f"{basename}.onnx")
+            if os.path.isfile(onnx):
+                return onnx
+        return original_path
+
     def _load_models(self) -> None:
         """(Re)load models from current ``state.model_paths``."""
         self._models.clear()
@@ -55,14 +88,25 @@ class InferenceThread(QtCore.QThread):
             path = self._state.model_paths.get(cid)
             if not path or not os.path.isfile(path):
                 continue
+            resolved = self._resolve_optimized_path(path)
             name = CLASS_NAMES.get(cid, str(cid))
-            self.status.emit(f"Loading {name}: {os.path.basename(path)}")
+            tag = os.path.basename(resolved)
+            self.status.emit(f"Loading {name}: {tag}")
             try:
-                model = YOLO(path)
+                model = YOLO(resolved)
                 model.to(self._device)
                 self._models[cid] = model
             except Exception as exc:
-                self.status.emit(f"Failed to load {name}: {exc}")
+                self.status.emit(f"Failed to load {name} ({tag}): {exc}")
+                # Fallback to original .pt if optimised version failed
+                if resolved != path:
+                    self.status.emit(f"Falling back to {os.path.basename(path)}")
+                    try:
+                        model = YOLO(path)
+                        model.to(self._device)
+                        self._models[cid] = model
+                    except Exception as exc2:
+                        self.status.emit(f"Also failed on fallback: {exc2}")
         self.status.emit(
             f"Inference backend: {self._device}"
             f"{' + FP16' if self._fp16 else ''}"
@@ -133,6 +177,11 @@ class InferenceThread(QtCore.QThread):
         cached_dets: List[Detection] = []
 
         while not state.stop_event.is_set():
+            # Hot-reload models if flagged (e.g. after optimised conversion)
+            if state.reload_models_flag:
+                state.reload_models_flag = False
+                self._load_models()
+
             # Pull next frame (with short timeout so we can still check stop).
             try:
                 packet = state.frame_queue.get(timeout=0.05)
@@ -213,18 +262,7 @@ class InferenceThread(QtCore.QThread):
                 detections_fresh=inferred_this_frame,
             )
 
-            # Push to detection queue; drop oldest if full.
-            try:
-                state.detection_queue.put_nowait(det_packet)
-            except queue.Full:
-                try:
-                    state.detection_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    state.detection_queue.put_nowait(det_packet)
-                except queue.Full:
-                    pass
+            state.put_safe(state.detection_queue, det_packet)
 
             # FPS reporting
             frame_count += 1

@@ -6,7 +6,6 @@ frame queue.  Handles playback pacing, pause / resume, and seek requests.
 """
 
 import time
-import queue
 from typing import Optional
 
 import cv2
@@ -67,18 +66,7 @@ class FrameGrabberThread(QtCore.QThread):
                         ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                         packet = FramePacket(index=frame_idx, frame=frame, timestamp_ms=ts_ms)
 
-                        try:
-                            state.frame_queue.put_nowait(packet)
-                        except queue.Full:
-                            try:
-                                state.frame_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                            try:
-                                state.frame_queue.put_nowait(packet)
-                            except queue.Full:
-                                pass
-
+                        state.put_safe(state.frame_queue, packet)
                         self.positionChanged.emit(frame_idx, ts_ms / 1000.0 if ts_ms else 0.0)
                         frame_idx += 1
 
@@ -96,19 +84,8 @@ class FrameGrabberThread(QtCore.QThread):
             ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             packet = FramePacket(index=frame_idx, frame=frame, timestamp_ms=ts_ms)
 
-            # Put into the queue; if full, drop the current frame rather than
-            # blocking forever (keeps the grabber responsive to stop / seek).
-            try:
-                state.frame_queue.put_nowait(packet)
-            except queue.Full:
-                try:
-                    state.frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    state.frame_queue.put_nowait(packet)
-                except queue.Full:
-                    pass
+            # Non-blocking put; drop oldest if full (keeps grabber responsive).
+            state.put_safe(state.frame_queue, packet)
 
             self.positionChanged.emit(frame_idx, ts_ms / 1000.0 if ts_ms else 0.0)
             frame_idx += 1

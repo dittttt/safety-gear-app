@@ -10,11 +10,14 @@ import cv2, numpy as np, qtawesome as qta
 import torch
 from PyQt5 import QtCore, QtGui, QtWidgets
 from config import (TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS,
-                    MODEL_EXTENSIONS, DEFAULT_MODEL_FILES)
+                    MODEL_EXTENSIONS, DEFAULT_MODEL_FILES,
+                    OPTIMIZED_GPU_DIR, OPTIMIZED_CPU_DIR)
 from pipeline.state import PipelineState
 from pipeline.frame_grabber import FrameGrabberThread
 from pipeline.inference_engine import InferenceThread
 from pipeline.tracker_logic import TrackerLogicThread
+from pipeline.convert_worker import ConvertWorker
+from utils.runtime_check import detect as _detect_runtimes
 from gui.widgets import VideoDropLabel, SeekSlider
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -183,6 +186,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # fullscreen state
         self._is_fs = False
         self._fs_hide = QtCore.QTimer(self)
+        # model conversion worker
+        self._converter: Optional[ConvertWorker] = None
+        self._cvt_t0: float = 0.0          # monotonic start time of conversion
+        self._cvt_label: str = ""           # last "Converting X → Y" message
+        # heartbeat timer: update status bar every 20 s during long TRT builds
+        self._cvt_timer = QtCore.QTimer(self)
+        self._cvt_timer.setInterval(20_000)
+        self._cvt_timer.timeout.connect(self._on_cvt_heartbeat)
         self._fs_hide.setSingleShot(True)
         self._fs_hide.setInterval(3000)
         self._fs_hide.timeout.connect(self._fs_hide_overlay)
@@ -483,6 +494,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mstat: Dict[int, QtWidgets.QLabel] = {}
         self._mtog: Dict[int, QtWidgets.QCheckBox] = {}
         self._mfile_box: Dict[int, QtWidgets.QWidget] = {}
+        self._mconv: Dict[int, QtWidgets.QPushButton] = {}  # convert buttons
         mcard = QtWidgets.QWidget(); mcard.setObjectName("modelCard")
         ml = QtWidgets.QVBoxLayout(mcard)
         ml.setContentsMargins(0, int(4*_S), 0, int(4*_S))
@@ -526,10 +538,36 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mbtn[cid] = btn
             fr.addWidget(btn)
 
+            # convert / optimise button (visible only for .pt models)
+            conv = QtWidgets.QPushButton()
+            conv.setObjectName("modelFileIcon")
+            conv.setIcon(_fa("bolt", _TD, bisz))
+            conv.setIconSize(QtCore.QSize(bisz, bisz))
+            conv.setFixedSize(_msq, _msq)
+            conv.setToolTip(f"Optimise {name} model for current device")
+            conv.setFlat(True)
+            conv.setFocusPolicy(QtCore.Qt.NoFocus)
+            conv.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            conv.setVisible(False)
+            self._mconv[cid] = conv
+            fr.addWidget(conv)
+
             self._set_model_color_btn_style(cid)
             tv.addWidget(file_box)
             ml.addWidget(block)
         lay.addWidget(mcard)
+
+        # "Optimize All" button – converts every loaded .pt model
+        self.btnOptimizeAll = QtWidgets.QPushButton()
+        _oisz = int(13 * _S)
+        self.btnOptimizeAll.setIcon(_fa("bolt", _T, _oisz))
+        self.btnOptimizeAll.setIconSize(QtCore.QSize(_oisz, _oisz))
+        self.btnOptimizeAll.setText("  Optimize All Models")
+        self.btnOptimizeAll.setFixedHeight(int(28 * _S))
+        self.btnOptimizeAll.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnOptimizeAll.setVisible(False)
+        lay.addWidget(self.btnOptimizeAll)
+
         lay.addSpacing(int(6 * _S))
 
         # DETECTION
@@ -750,6 +788,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for cid, btn in self._mbtn.items():
             btn.clicked.connect(
                 lambda _=False, c=cid: self._on_load_model(c))
+        for cid, conv in self._mconv.items():
+            conv.clicked.connect(
+                lambda _=False, c=cid: self._on_convert_model(c))
+        self.btnOptimizeAll.clicked.connect(self._on_convert_all)
         self.videoDisplay.filesDropped.connect(self._on_files_dropped)
         self.btnPlay.clicked.connect(self._on_play_pause)
         self.btnStepFwd.clicked.connect(self._step_forward)
@@ -818,6 +860,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(
             f"Auto-loaded: {', '.join(loaded)}" if loaded
             else "No default models found \u2014 load via sidebar")
+        self._update_convert_buttons()
 
     # ── video / model loading ─────────────────────────────────────────────
 
@@ -849,6 +892,7 @@ class MainWindow(QtWidgets.QMainWindow):
         st.style().unpolish(st); st.style().polish(st)
         st.setToolTip(path)
         self._set_model_color_btn_style(cid)
+        self._update_convert_buttons()
 
     def _on_files_dropped(self, paths: list) -> None:
         unknown: list[str] = []
@@ -1075,6 +1119,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_device_changed(self) -> None:
         device = str(self.deviceCombo.currentData() or "auto")
         self._state.set_device(device)
+        self._update_convert_buttons()
         self._set_status(f"Device set to {device.upper()} (takes effect on next start)")
 
     def _on_fp16_toggled(self, enabled: bool) -> None:
@@ -1086,6 +1131,235 @@ class MainWindow(QtWidgets.QMainWindow):
         self.strideLabel.setText(str(v))
         self._state.set_inference_stride(v)
         self._set_status(f"Inference stride set to {v}x")
+
+    # ── model optimisation ────────────────────────────────────────────────
+
+    def _get_current_device_key(self) -> str:
+        """Return 'cuda' or 'cpu' based on current combo box selection."""
+        raw = str(self.deviceCombo.currentData() or "auto").lower()
+        if raw == "cpu":
+            return "cpu"
+        if raw in ("cuda", "auto") and torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+
+    def _optimized_exists_for(self, cid: int, dev: str) -> bool:
+        """Check whether an optimised model exists for *cid* + specific *dev*."""
+        path = self._state.model_paths.get(cid)
+        if not path or not path.lower().endswith(".pt"):
+            return False
+        basename = os.path.splitext(os.path.basename(path))[0]
+        if dev == "cuda":
+            return (
+                os.path.isfile(os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.engine"))
+                or os.path.isfile(os.path.join(OPTIMIZED_GPU_DIR, f"{basename}.onnx"))
+            )
+        else:
+            return (
+                os.path.isdir(os.path.join(OPTIMIZED_CPU_DIR, f"{basename}_openvino_model"))
+                or os.path.isfile(os.path.join(OPTIMIZED_CPU_DIR, f"{basename}.onnx"))
+            )
+
+    def _optimized_exists(self, cid: int) -> bool:
+        """Check whether an optimised model exists for *cid* + current device."""
+        return self._optimized_exists_for(cid, self._get_current_device_key())
+
+    def _update_convert_buttons(self) -> None:
+        """Show / hide per-model convert buttons and the Optimize-All button."""
+        rt = _detect_runtimes()
+        has_cuda = torch.cuda.is_available()
+
+        # Build a combined tooltip string for what will be converted
+        parts = []
+        if has_cuda and rt.best_gpu_format != "pt":
+            ver = rt.tensorrt_ver if rt.best_gpu_format == "engine" else rt.onnx_ver
+            tag = {"engine": "TensorRT", "onnx": "ONNX"}.get(rt.best_gpu_format, rt.best_gpu_format.upper())
+            parts.append(f"GPU → {tag} {ver}".strip())
+        if rt.best_cpu_format != "pt":
+            ver = rt.openvino_ver if rt.best_cpu_format == "openvino" else rt.onnx_ver
+            tag = {"openvino": "OpenVINO", "onnx": "ONNX"}.get(rt.best_cpu_format, rt.best_cpu_format.upper())
+            parts.append(f"CPU → {tag} {ver}".strip())
+        convert_tip = "Convert: " + " + ".join(parts) if parts else ""
+
+        any_eligible = False
+        for cid in TARGET_CLASS_IDS:
+            path = self._state.model_paths.get(cid)
+            is_pt = bool(path and path.lower().endswith(".pt"))
+
+            if not is_pt:
+                self._mconv[cid].setVisible(False)
+                continue
+
+            # Per-device existence checks
+            gpu_done = (not has_cuda) or self._optimized_exists_for(cid, "cuda")
+            cpu_done = self._optimized_exists_for(cid, "cpu")
+            all_done = gpu_done and cpu_done
+            no_runtime = not parts  # no useful format for any device
+
+            btn = self._mconv[cid]
+            if all_done:
+                # Both devices optimised — green check
+                gpu_fmt = {"engine": "TRT", "onnx": "ONNX"}.get(rt.best_gpu_format, "")
+                cpu_fmt = {"openvino": "OV",  "onnx": "ONNX"}.get(rt.best_cpu_format, "")
+                check_tip = " + ".join(filter(None, [
+                    (f"GPU:{gpu_fmt}" if has_cuda else ""),
+                    f"CPU:{cpu_fmt}",
+                ]))
+                btn.setVisible(True)
+                btn.setEnabled(False)
+                btn.setIcon(_fa("check-circle", "#4CAF50", int(11 * _S)))
+                btn.setToolTip(f"Fully optimised ({check_tip})")
+            elif no_runtime:
+                btn.setVisible(True)
+                btn.setEnabled(False)
+                btn.setIcon(_fa("exclamation-triangle", "#888", int(11 * _S)))
+                btn.setToolTip("No optimisation runtime installed (tensorrt / openvino)")
+            else:
+                # At least one device still needs conversion
+                missing = []
+                if has_cuda and not gpu_done:
+                    missing.append("GPU")
+                if not cpu_done:
+                    missing.append("CPU")
+                pending_tip = convert_tip + (f" [{', '.join(missing)} pending]" if missing else "")
+                btn.setVisible(True)
+                btn.setEnabled(True)
+                btn.setIcon(_fa("bolt", _TD, int(11 * _S)))
+                btn.setToolTip(pending_tip)
+                any_eligible = True
+
+        self.btnOptimizeAll.setVisible(any_eligible)
+
+    def _build_convert_jobs(self, cids=None):
+        """Return a list of ConvertJob tuples for eligible models.
+
+        Always queues jobs for BOTH devices so one click optimises for
+        GPU (TensorRT) AND CPU (OpenVINO) simultaneously.
+        """
+        if cids is None:
+            cids = TARGET_CLASS_IDS
+        imgsz = self._state.get_imgsz()
+        # Always convert for both targets; skip devices that have no useful format
+        devices = ["cuda", "cpu"] if torch.cuda.is_available() else ["cpu"]
+        jobs = []
+        for dev in devices:
+            half = self._state.use_fp16() and dev == "cuda"
+            for cid in cids:
+                path = self._state.model_paths.get(cid)
+                if not path or not path.lower().endswith(".pt"):
+                    continue
+                if self._optimized_exists_for(cid, dev):
+                    continue
+                jobs.append((cid, path, dev, imgsz, half))
+        return jobs
+
+    def _on_convert_model(self, cid: int) -> None:
+        """Start conversion for a single model (GPU + CPU)."""
+        jobs = self._build_convert_jobs(cids=[cid])
+        if not jobs:
+            self._set_status("Nothing to convert (already optimised or not a .pt model)")
+            return
+        rt = _detect_runtimes()
+        parts = []
+        if torch.cuda.is_available():
+            parts.append(rt.gpu_summary)
+        parts.append(rt.cpu_summary)
+        self._set_status("Starting conversion · " + " | ".join(parts))
+        self._start_conversion(jobs)
+
+    def _on_convert_all(self) -> None:
+        """Start conversion for every eligible model (GPU + CPU)."""
+        jobs = self._build_convert_jobs()
+        if not jobs:
+            self._set_status("All models already optimised")
+            return
+        rt = _detect_runtimes()
+        parts = []
+        if torch.cuda.is_available():
+            parts.append(rt.gpu_summary)
+        parts.append(rt.cpu_summary)
+        self._set_status("Batch conversion started · " + " | ".join(parts))
+        self._start_conversion(jobs)
+
+    def _start_conversion(self, jobs) -> None:
+        if self._converter and self._converter.isRunning():
+            self._set_status("A conversion is already running — please wait")
+            return
+        self._converter = ConvertWorker(jobs)   # no parent — we manage lifetime
+        self._converter.conversion_started.connect(self._on_cvt_started)
+        self._converter.conversion_progress.connect(self._on_cvt_progress)
+        self._converter.conversion_finished.connect(self._on_cvt_finished)
+        self._converter.all_finished.connect(self._on_cvt_all_done)
+        # Disable convert buttons while running
+        for cid in TARGET_CLASS_IDS:
+            self._mconv[cid].setEnabled(False)
+        self.btnOptimizeAll.setEnabled(False)
+        self._converter.start()
+
+    def _on_cvt_started(self, cid: int, msg: str) -> None:
+        import time
+        self._cvt_t0 = time.monotonic()
+        self._cvt_label = msg
+        self._set_status(msg)
+        self._cvt_timer.start()   # kick off heartbeat
+        btn = self._mconv.get(cid)
+        if btn:
+            btn.setIcon(_fa("spinner", "#FFC107", int(11 * _S)))
+            btn.setToolTip("Converting…")
+
+    def _on_cvt_heartbeat(self) -> None:
+        """Called every 20 s while a conversion is in progress."""
+        import time
+        if not (self._converter and self._converter.isRunning()):
+            self._cvt_timer.stop()
+            return
+        elapsed = int(time.monotonic() - self._cvt_t0)
+        self._set_status(
+            f"{self._cvt_label}  ({elapsed}s elapsed — TRT builds take 3-5 min)")
+
+    def _on_cvt_progress(self, cid: int, msg: str) -> None:
+        self._cvt_label = msg   # keep heartbeat message in sync
+        self._set_status(msg)
+
+    def _on_cvt_finished(self, cid: int, success: bool, result: str) -> None:
+        # Infer format from the result path (works for both GPU and CPU jobs)
+        r = result.lower()
+        if ".engine" in r:
+            fmt_name = "TensorRT"
+        elif "openvino" in r:
+            fmt_name = "OpenVINO"
+        elif r.endswith(".onnx"):
+            fmt_name = "ONNX"
+        else:
+            fmt_name = "optimised"
+
+        if success:
+            self._set_status(
+                f"{CLASS_NAMES.get(cid, '')} → {fmt_name} ✓  ({os.path.basename(result)})")
+            btn = self._mconv.get(cid)
+            if btn:
+                btn.setIcon(_fa("check-circle", "#4CAF50", int(11 * _S)))
+                btn.setToolTip(f"Optimised ({fmt_name})")
+                btn.setEnabled(False)
+        else:
+            self._set_status(
+                f"{CLASS_NAMES.get(cid, '')} conversion failed: {result.splitlines()[0]}")
+            btn = self._mconv.get(cid)
+            if btn:
+                btn.setIcon(_fa("exclamation-triangle", "#f44336", int(11 * _S)))
+                btn.setToolTip(f"Conversion failed — click to retry")
+                btn.setEnabled(True)
+
+    def _on_cvt_all_done(self) -> None:
+        """All jobs finished — refresh buttons and trigger model hot-reload."""
+        self._cvt_timer.stop()
+        self._update_convert_buttons()
+        for cid in TARGET_CLASS_IDS:
+            self._mconv[cid].setEnabled(True)
+        self.btnOptimizeAll.setEnabled(True)
+        # Tell inference engine to reload with the new optimised weights
+        self._state.reload_models_flag = True
+        self._set_status("Model optimisation complete — inference will reload")
 
     def _show_speed_menu(self) -> None:
         menu = QtWidgets.QMenu(self)
@@ -1141,6 +1415,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, e):
         self._on_stop()
+        # Stop conversion worker before closing (avoids crash from live QThread)
+        if self._converter and self._converter.isRunning():
+            self._cvt_timer.stop()
+            self._converter.request_stop()      # kill child subprocess + set flag
+            # Disconnect signals first so no slots fire on dead objects
+            try:
+                self._converter.conversion_started.disconnect()
+                self._converter.conversion_progress.disconnect()
+                self._converter.conversion_finished.disconnect()
+                self._converter.all_finished.disconnect()
+            except Exception:
+                pass
+            self._converter.wait(5000)          # give it up to 5 s gracefully
+            if self._converter.isRunning():
+                self._converter.terminate()     # force-kill if still running
+                self._converter.wait(1000)
         if self._preview_cap is not None:
             self._preview_cap.release(); self._preview_cap = None
         e.accept()
