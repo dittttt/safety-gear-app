@@ -266,12 +266,18 @@ class ConvertWorker(QtCore.QThread):
                     timeout_s = self.OPENVINO_TIMEOUT_SEC
                 else:
                     timeout_s = self.ONNX_TIMEOUT_SEC
+                # Precision policy: always export FP32. Runtime FP16 is
+                # applied only for in-memory PyTorch `.pt` models via
+                # `.half()` during inference. This avoids producing
+                # backend-specific FP16 artifacts during conversion.
+                export_half = False
+
                 try:
                     result_path = self._export_in_subprocess(
                         model_path=dest_pt,
                         fmt=fmt,
                         imgsz=imgsz,
-                        half=(half if fmt == "engine" else False),
+                        half=export_half,
                         cwd=target_dir,
                         timeout_s=timeout_s,
                     )

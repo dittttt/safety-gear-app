@@ -33,6 +33,26 @@ def _fa(name, color=_T, sz=18):
     return qta.icon(f"fa5s.{name}", color=color)
 
 
+_S = 1.5  # fixed UI scale - restore missing global
+_DROP_PROMPT = "Drop a video here or use the sidebar to load one"
+_FS_ICON_SIZE = int(16 * _S)
+_STAT_ITEMS = (
+    ("motorcycles", "Motos"),
+    ("riders", "Riders"),
+    ("no_helmet", "No Helmet"),
+    ("overloaded_motos", "Overload"),
+    ("invalid_detections", "Occluded"),
+)
+_CLASS_INFER_RULES = (
+    (4, ("improper", "no footwear", "barefoot")),
+    (3, ("footwear", "shoe", "boot")),
+    (2, ("helmet", "hardhat")),
+    (0, ("motorcycle", "motorbike", "moto")),
+    (1, ("rider", "driver", "person")),
+)
+_CLASS_INFER_TRANSLATE = str.maketrans("-_.", "   ")
+
+
 class _AlignedComboBox(QtWidgets.QComboBox):
     """QComboBox that shows a speed-menu-style QMenu popup instead of the
     native Qt dropdown, giving full style control."""
@@ -79,25 +99,9 @@ class _AlignedComboBox(QtWidgets.QComboBox):
         if chosen is not None:
             self.setCurrentIndex(chosen.data())
 
-_S = 1.5  # fixed UI scale – no dynamic rescaling
-_DROP_PROMPT = "Drop a video here or use the sidebar to load one"
-_FS_ICON_SIZE = int(16 * _S)
-_STAT_ITEMS = (
-    ("motorcycles", "Motos"),
-    ("riders", "Riders"),
-    ("no_helmet", "No Helmet"),
-    ("overloaded_motos", "Overload"),
-    ("invalid_detections", "Occluded"),
-)
-_CLASS_INFER_RULES = (
-    (4, ("improper", "no footwear", "barefoot")),
-    (3, ("footwear", "shoe", "boot")),
-    (2, ("helmet", "hardhat")),
-    (0, ("motorcycle", "motorbike", "moto")),
-    (1, ("rider", "driver", "person")),
-)
-_CLASS_INFER_TRANSLATE = str.maketrans("-_.", "   ")
-
+        lay.addStretch()
+        scroll.setWidget(content); outer.addWidget(scroll)
+        return sb
 
 def _qss(s: float, chk: str) -> str:
     """Full stylesheet – every pixel value multiplied by *s*."""
@@ -259,8 +263,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Safety Gear Compliance")
-        self.setMinimumSize(1024, 600)
         self.resize(1630, 760)
         self.setAcceptDrops(True)
         self._chk = self._make_checkmark_icon()
@@ -811,9 +813,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.deviceCombo.addItem("CPU", "cpu")
         dl.addWidget(self.deviceCombo)
 
-        self.chkFp16 = QtWidgets.QCheckBox("Use FP16 (GPU only)")
-        self.chkFp16.setChecked(False)
-        dl.addWidget(self.chkFp16)
+        self.btnFp16 = QtWidgets.QPushButton("Use FP16 instead of FP32")
+        self.btnFp16.setCheckable(True)
+        self.btnFp16.setChecked(False)
+        self.btnFp16.setFixedHeight(int(26 * _S))
+        self.btnFp16.setFocusPolicy(QtCore.Qt.NoFocus)
+        dl.addWidget(self.btnFp16)
 
         stride_lbl = QtWidgets.QLabel("Inference Stride")
         stride_lbl.setObjectName("sliderLabel")
@@ -834,6 +839,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dl.addLayout(sr)
 
         lay.addWidget(dcard)
+        lay.addSpacing(int(6 * _S))
+
         lay.addStretch()
         scroll.setWidget(content); outer.addWidget(scroll)
         return sb
@@ -1044,7 +1051,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.iouSlider.valueChanged.connect(self._on_iou)
         self.imgszCombo.currentIndexChanged.connect(self._on_imgsz_changed)
         self.deviceCombo.currentIndexChanged.connect(self._on_device_changed)
-        self.chkFp16.toggled.connect(self._on_fp16_toggled)
+        self.btnFp16.toggled.connect(self._on_fp16_toggled)
         self.strideSlider.valueChanged.connect(self._on_stride_changed)
 
     def _on_pick_model_color(self, cid: int) -> None:
@@ -1135,7 +1142,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.strideSlider.setValue(default_stride)
         self.strideLabel.setText(str(default_stride))
         self.deviceCombo.setCurrentIndex(1 if use_cuda else 0)
-        self.chkFp16.setChecked(use_cuda)
+        self.btnFp16.setChecked(use_cuda)
         self._set_status(
             f"Auto-loaded: {', '.join(loaded)}" if loaded
             else "No default models found \u2014 load via sidebar")
@@ -1538,8 +1545,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_fp16_toggled(self, enabled: bool) -> None:
         self._state.set_use_fp16(bool(enabled))
-        self._set_status("FP16 enabled (GPU only, takes effect on next start)"
-                         if enabled else "FP16 disabled")
+        self._set_status(
+            "FP16 preference enabled (used for optimization + CUDA inference)"
+            if enabled else
+            "FP16 preference disabled (use FP32)"
+        )
 
     def _on_stride_changed(self, v: int) -> None:
         self.strideLabel.setText(str(v))
@@ -1629,7 +1639,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # CPU job
             if rt.best_cpu_format != "pt":
                 if not group.get_variant(rt.best_cpu_format):
-                    jobs.append((cid, pt_variant.path, "cpu", imgsz, False))
+                    half = self._state.use_fp16()
+                    jobs.append((cid, pt_variant.path, "cpu", imgsz, half))
 
         return jobs
 
