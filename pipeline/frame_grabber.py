@@ -5,6 +5,7 @@ Continuously reads video frames and pushes ``FramePacket`` objects into the
 frame queue.  Handles playback pacing, pause / resume, and seek requests.
 """
 
+import os
 import time
 from typing import Optional
 
@@ -36,6 +37,9 @@ class FrameGrabberThread(QtCore.QThread):
             self.error.emit("No video path set")
             return
 
+        # Keep FFmpeg warnings quiet during frequent random-access seeks.
+        os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
+
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             self.error.emit(f"Cannot open: {path}")
@@ -55,20 +59,32 @@ class FrameGrabberThread(QtCore.QThread):
             seek_target = state.consume_seek()
             if seek_target is not None:
                 state.flush_queues()
-                cap.set(cv2.CAP_PROP_POS_FRAMES, seek_target)
-                frame_idx = seek_target
+                # Decode from slightly before target to avoid H264 reference
+                # picture issues on non-keyframe random seeks.
+                warmup = max(2, int(fps * 0.5))
+                start_idx = max(0, int(seek_target) - warmup)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+                frame_idx = start_idx
+
+                while frame_idx < int(seek_target):
+                    if not cap.grab():
+                        self.finished_signal.emit()
+                        cap.release()
+                        return
+                    frame_idx += 1
+
                 state.reset_tracker_flag = True
                 next_frame_time = time.perf_counter()
 
-                if state.pause_event.is_set():
-                    ok, frame = cap.read()
-                    if ok:
-                        ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-                        packet = FramePacket(index=frame_idx, frame=frame, timestamp_ms=ts_ms)
-
-                        state.put_safe(state.frame_queue, packet)
-                        self.positionChanged.emit(frame_idx, ts_ms / 1000.0 if ts_ms else 0.0)
-                        frame_idx += 1
+                # Always decode and publish one frame immediately after seek,
+                # so UI updates instantly in both paused and playing states.
+                ok, frame = cap.read()
+                if ok:
+                    ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    packet = FramePacket(index=frame_idx, frame=frame, timestamp_ms=ts_ms)
+                    state.put_safe(state.frame_queue, packet)
+                    self.positionChanged.emit(frame_idx, ts_ms / 1000.0 if ts_ms else 0.0)
+                    frame_idx += 1
 
             # ── Pause ──────────────────────────────────────────────────────
             if state.pause_event.is_set():

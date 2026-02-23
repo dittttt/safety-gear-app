@@ -60,7 +60,7 @@ class DetectionConfig:
     conf: float = 0.25
     iou: float = 0.45
     imgsz: int = 256
-    inference_batch_size: int = 32
+    inference_batch_size: int = 4
     inference_stride: int = 6
     use_fp16: bool = False
     device: str = "auto"

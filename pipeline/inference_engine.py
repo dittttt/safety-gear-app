@@ -24,6 +24,7 @@ import torch
 
 from config import TARGET_CLASS_IDS, CLASS_NAMES
 from pipeline.state import PipelineState, Detection, DetectionPacket
+from utils.runtime_check import detect as detect_runtime
 
 
 class InferenceThread(QtCore.QThread):
@@ -39,6 +40,7 @@ class InferenceThread(QtCore.QThread):
         self._model_paths: Dict[int, str] = {}
         self._device: str = "cpu"
         self._fp16: bool = False
+        self._rt = detect_runtime()
         # Suppress noisy backend setup chatter (especially TensorRT/OpenVINO)
         ULTRA_LOGGER.setLevel(logging.WARNING)
 
@@ -58,6 +60,74 @@ class InferenceThread(QtCore.QThread):
     def _can_move_to_device(path: str) -> bool:
         return str(path).lower().endswith(".pt")
 
+    @staticmethod
+    def _is_openvino_path(path: str) -> bool:
+        p = str(path or "").lower()
+        return os.path.isdir(path) and (
+            p.endswith("_openvino_model")
+            or p.endswith("_ov_model")
+            or os.path.isfile(os.path.join(path, "metadata.yaml"))
+        )
+
+    def _fallback_model_path(self, path: str) -> Optional[str]:
+        """Return a compatible fallback artifact next to *path* if available."""
+        if not path:
+            return None
+        if os.path.isdir(path):
+            base_dir = os.path.dirname(path)
+            stem = os.path.basename(base_dir)
+        else:
+            base_dir = os.path.dirname(path)
+            stem = os.path.splitext(os.path.basename(path))[0]
+
+        candidates = [
+            os.path.join(base_dir, f"{stem}.pt"),
+            os.path.join(base_dir, f"{stem}.onnx"),
+            os.path.join(base_dir, f"{stem}_openvino_model"),
+            os.path.join(base_dir, f"{stem}_OV_model"),
+        ]
+        cur = os.path.normpath(path)
+        for cand in candidates:
+            if os.path.normpath(cand) == cur:
+                continue
+            if self._path_exists(cand):
+                return cand
+        return None
+
+    def _runtime_supports_path(self, path: str) -> bool:
+        p = str(path or "").lower()
+        if p.endswith(".engine"):
+            return bool(self._rt.has_tensorrt)
+        if self._is_openvino_path(path):
+            return bool(self._rt.has_openvino)
+        return True
+
+    def _try_rebind_fallback_model(self, cid: int, reason: str = "") -> bool:
+        cur = self._model_paths.get(cid)
+        fb = self._fallback_model_path(cur or "")
+        if not fb or not self._path_exists(fb):
+            return False
+        try:
+            model = YOLO(fb, task="detect", verbose=False)
+            if self._can_move_to_device(fb):
+                model.to(self._device)
+                if self._fp16:
+                    try:
+                        model.model.half()
+                    except Exception:
+                        pass
+            self._models[cid] = model
+            self._model_paths[cid] = fb
+            self._state.model_paths[cid] = fb
+            name = CLASS_NAMES.get(cid, str(cid))
+            self.status.emit(
+                f"{name}: fallback model bound -> {os.path.basename(fb)}"
+                + (f" ({reason})" if reason else "")
+            )
+            return True
+        except Exception:
+            return False
+
     # ── Model management ───────────────────────────────────────────────────────
 
     def _load_models(self) -> None:
@@ -69,12 +139,23 @@ class InferenceThread(QtCore.QThread):
         """
         self._models.clear()
         self._model_paths.clear()
+        self._rt = detect_runtime()
         self._device = self._resolve_device()
         self._fp16 = self._state.use_fp16() and self._device.startswith("cuda")
         for cid in TARGET_CLASS_IDS:
             path = self._state.model_paths.get(cid)
             if not self._path_exists(path):
                 continue
+            if not self._runtime_supports_path(path):
+                fb = self._fallback_model_path(path)
+                if fb and self._path_exists(fb):
+                    name = CLASS_NAMES.get(cid, str(cid))
+                    self.status.emit(
+                        f"{name}: runtime unsupported for {os.path.basename(path)}, "
+                        f"using {os.path.basename(fb)}"
+                    )
+                    path = fb
+                    self._state.model_paths[cid] = fb
             name = CLASS_NAMES.get(cid, str(cid))
             tag = os.path.basename(path)
             self.status.emit(f"Loading {name}: {tag}")
@@ -90,6 +171,29 @@ class InferenceThread(QtCore.QThread):
                 self._models[cid] = model
                 self._model_paths[cid] = path
             except Exception as exc:
+                fb = self._fallback_model_path(path)
+                if fb and self._path_exists(fb):
+                    fb_tag = os.path.basename(fb)
+                    self.status.emit(
+                        f"{name}: failed loading {tag}, fallback to {fb_tag}"
+                    )
+                    try:
+                        model = YOLO(fb, task="detect", verbose=False)
+                        if self._can_move_to_device(fb):
+                            model.to(self._device)
+                            if self._fp16:
+                                try:
+                                    model.model.half()
+                                except Exception:
+                                    pass
+                        self._models[cid] = model
+                        self._model_paths[cid] = fb
+                        self._state.model_paths[cid] = fb
+                        continue
+                    except Exception as fb_exc:
+                        self.status.emit(
+                            f"Failed fallback load {name} ({fb_tag}): {fb_exc}"
+                        )
                 self.status.emit(f"Failed to load {name} ({tag}): {exc}")
         self.status.emit(
             f"Inference backend: {self._device}"
@@ -111,15 +215,23 @@ class InferenceThread(QtCore.QThread):
             kwargs["half"] = self._fp16
         return kwargs
 
-    def _predict_with_fallback(self, cid: int, frames: List[np.ndarray], kwargs: dict):
+    def _predict_with_fallback(
+        self,
+        cid: int,
+        frames: List[np.ndarray],
+        kwargs: dict,
+        allow_batch: bool,
+    ):
         """Try batch predict first; fallback to per-frame on backend limitations."""
         model = self._models[cid]
-        try:
-            results = model.predict(frames, **kwargs)
-            if isinstance(results, (list, tuple)) and len(results) == len(frames):
-                return list(results)
-        except Exception:
-            pass
+        had_error = False
+        if allow_batch:
+            try:
+                results = model.predict(frames, **kwargs)
+                if isinstance(results, (list, tuple)) and len(results) == len(frames):
+                    return list(results)
+            except Exception:
+                had_error = True
 
         # Backend may not support list/batch inputs reliably; fallback safely
         out = []
@@ -131,7 +243,33 @@ class InferenceThread(QtCore.QThread):
                 else:
                     out.append(r)
             except Exception:
+                had_error = True
                 out.append(None)
+
+        # If everything failed, try rebinding to a fallback artifact once.
+        if had_error and out and all(r is None for r in out):
+            if self._try_rebind_fallback_model(cid, reason="runtime predict failure"):
+                model = self._models[cid]
+                path = self._model_paths.get(cid, "")
+                allow_batch2 = not self._is_openvino_path(path)
+                if allow_batch2:
+                    try:
+                        results = model.predict(frames, **kwargs)
+                        if isinstance(results, (list, tuple)) and len(results) == len(frames):
+                            return list(results)
+                    except Exception:
+                        pass
+                out2 = []
+                for frame in frames:
+                    try:
+                        r = model.predict(frame, **kwargs)
+                        if isinstance(r, (list, tuple)):
+                            out2.append(r[0] if r else None)
+                        else:
+                            out2.append(r)
+                    except Exception:
+                        out2.append(None)
+                return out2
         return out
 
     # ── Detection extraction helpers ───────────────────────────────────────────
@@ -227,7 +365,14 @@ class InferenceThread(QtCore.QThread):
                     if cid not in self._models or not state.is_model_enabled(cid):
                         continue
                     kwargs = self._predict_kwargs_for(cid, conf, iou, imgsz)
-                    results = self._predict_with_fallback(cid, infer_frames, kwargs)
+                    path = self._model_paths.get(cid, "")
+                    allow_batch = not self._is_openvino_path(path)
+                    results = self._predict_with_fallback(
+                        cid,
+                        infer_frames,
+                        kwargs,
+                        allow_batch=allow_batch,
+                    )
                     for local_i, result in enumerate(results):
                         if local_i >= len(infer_idxs) or result is None:
                             continue

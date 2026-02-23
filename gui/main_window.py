@@ -339,6 +339,33 @@ class MainWindow(QtWidgets.QMainWindow):
     def _to_bgr_tuple(color: QtGui.QColor) -> tuple[int, int, int]:
         return (color.blue(), color.green(), color.red())
 
+    def _video_scale_mode(self) -> QtCore.Qt.AspectRatioMode:
+        """Prefer fill mode for near-16:9 sources to avoid pillar bars."""
+        if self._last_rgb_frame is None:
+            return QtCore.Qt.KeepAspectRatio
+        h, w = self._last_rgb_frame.shape[:2]
+        if h <= 0:
+            return QtCore.Qt.KeepAspectRatio
+        src_ar = w / float(h)
+        if abs(src_ar - (16.0 / 9.0)) <= 0.03:
+            return QtCore.Qt.KeepAspectRatioByExpanding
+        return QtCore.Qt.KeepAspectRatio
+
+    def _fit_window_to_video_aspect(self, src_w: int, src_h: int) -> None:
+        """Resize window width so main video viewport matches source AR."""
+        if src_w <= 0 or src_h <= 0 or self._is_fs:
+            return
+        src_ar = src_w / float(src_h)
+        top_h = self._topBar.height() if hasattr(self, "_topBar") else 0
+        status_h = self.statusLabel.height() if hasattr(self, "statusLabel") else 0
+        main_h = max(180, self.height() - top_h - status_h)
+        target_main_w = int(round(main_h * src_ar))
+        sidebar_w = self.sidebar.width() if hasattr(self, "sidebar") else int(260 * _S)
+        handle_w = self._splitter.handleWidth() if hasattr(self, "_splitter") else 1
+        target_total_w = target_main_w + sidebar_w + handle_w
+        target_total_w = max(self.minimumWidth(), target_total_w)
+        self.resize(target_total_w, self.height())
+
     # ── ui ────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -853,8 +880,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if obj is self._vc and etype == QtCore.QEvent.Resize:
             self._repos()
             if not self._last_pixmap.isNull():
+                mode = self._video_scale_mode()
                 self.videoDisplay.setPixmap(self._last_pixmap.scaled(
-                    self.videoDisplay.size(), QtCore.Qt.KeepAspectRatio,
+                    self.videoDisplay.size(), mode,
                     QtCore.Qt.FastTransformation))
         # fullscreen: mouse movement on video/overlay → show controls
         if self._is_fs and etype == QtCore.QEvent.MouseMove:
@@ -1095,11 +1123,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 loaded.append(CLASS_NAMES[cid])
         use_cuda = torch.cuda.is_available()
         default_imgsz = 320 if use_cuda else 256
-        default_stride = 3 if use_cuda else 6
+        default_stride = 1 if use_cuda else 2
+        default_batch = 4 if use_cuda else 2
         self._state.set_imgsz(default_imgsz)
         self._state.set_device("cuda" if use_cuda else "auto")
         self._state.set_use_fp16(use_cuda)
         self._state.set_inference_stride(default_stride)
+        self._state.set_inference_batch_size(default_batch)
 
         self.imgszCombo.setCurrentText(str(default_imgsz))
         self.strideSlider.setValue(default_stride)
@@ -1315,6 +1345,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_cap = cv2.VideoCapture(path)
         if ok and frame is not None:
             self._show_frame(frame)
+            fh, fw = frame.shape[:2]
+            self._fit_window_to_video_aspect(fw, fh)
         self._state.video_path = path
         self._video_fps, self._total_frames = float(fps), total
         self._init_seek()
@@ -1427,12 +1459,10 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── display ───────────────────────────────────────────────────────────
 
     def _poll_display(self) -> None:
-        packet = None
-        while True:
-            try:
-                packet = self._state.display_queue.get_nowait()
-            except queue.Empty:
-                break
+        try:
+            packet = self._state.display_queue.get_nowait()
+        except queue.Empty:
+            packet = None
         if packet is not None:
             self._show_frame(packet.annotated_frame)
 
@@ -1443,8 +1473,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_pixmap = QtGui.QPixmap.fromImage(
             QtGui.QImage(rgb.data, w, h, c * w,
                          QtGui.QImage.Format_RGB888))
+        mode = self._video_scale_mode()
         self.videoDisplay.setPixmap(self._last_pixmap.scaled(
-            self.videoDisplay.size(), QtCore.Qt.KeepAspectRatio,
+            self.videoDisplay.size(), mode,
             QtCore.Qt.FastTransformation))
 
     # ── callbacks ─────────────────────────────────────────────────────────
