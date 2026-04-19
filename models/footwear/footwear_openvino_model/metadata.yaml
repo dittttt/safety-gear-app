@@ -1,7 +1,7 @@
 description: Ultralytics YOLO11s-p2 model trained on C:\Users\ditto\Desktop\CODES\safety-gear-compliance\datasets\generated\footwear_detector_final\data.yaml
 author: Ultralytics
-date: '2026-02-22T19:15:01.911842'
-version: 8.4.9
+date: '2026-04-20T00:06:17.778751'
+version: 8.4.14
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
 stride: 16

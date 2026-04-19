@@ -32,3 +32,23 @@
 19:15:05 INFO [4/4] Job start: cid=4  file=improper_footwear.pt  device=cpu  fmt=openvino
 19:15:05 INFO [4/4] Exporting improper_footwear → OPENVINO (imgsz=320)
 19:15:12 INFO Export OK in 6.8s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\optimized\CPU\improper_footwear_openvino_model
+00:05:42 INFO ConvertWorker starting — 1 job(s)
+00:05:42 INFO [1/1] Job start: cid=0  file=motorcycle.pt  device=cpu  fmt=openvino
+00:05:42 INFO [1/1] Exporting motorcycle → OPENVINO (imgsz=320)
+00:05:51 INFO Export OK in 8.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\motorcycle\motorcycle_openvino_model
+00:05:56 INFO ConvertWorker starting — 1 job(s)
+00:05:56 INFO [1/1] Job start: cid=1  file=rider.pt  device=cpu  fmt=openvino
+00:05:56 INFO [1/1] Exporting rider → OPENVINO (imgsz=320)
+00:06:04 INFO Export OK in 7.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\rider\rider_openvino_model
+00:06:05 INFO ConvertWorker starting — 1 job(s)
+00:06:05 INFO [1/1] Job start: cid=2  file=helmet.pt  device=cpu  fmt=openvino
+00:06:05 INFO [1/1] Exporting helmet → OPENVINO (imgsz=320)
+00:06:13 INFO Export OK in 7.4s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\helmet\helmet_openvino_model
+00:06:13 INFO ConvertWorker starting — 1 job(s)
+00:06:13 INFO [1/1] Job start: cid=3  file=footwear.pt  device=cpu  fmt=openvino
+00:06:13 INFO [1/1] Exporting footwear → OPENVINO (imgsz=320)
+00:06:21 INFO Export OK in 7.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\footwear\footwear_openvino_model
+00:06:22 INFO ConvertWorker starting — 1 job(s)
+00:06:22 INFO [1/1] Job start: cid=4  file=improper_footwear.pt  device=cpu  fmt=openvino
+00:06:22 INFO [1/1] Exporting improper_footwear → OPENVINO (imgsz=320)
+00:06:29 INFO Export OK in 7.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\improper_footwear\improper_footwear_openvino_model

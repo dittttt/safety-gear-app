@@ -27,6 +27,8 @@ from config import (
 )
 from pipeline.state import PipelineState, Detection, DisplayPacket
 
+COLOR_UNKNOWN_BGR: Tuple[int, int, int] = (0, 215, 255)
+
 
 # ── Geometry helpers ───────────────────────────────────────────────────────────
 
@@ -52,6 +54,35 @@ def _ioa(child: Tuple[int, int, int, int], parent: Tuple[int, int, int, int]) ->
     return _intersection_area(child, parent) / float(area)
 
 
+def _box_center(box: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def _point_in_box(pt: Tuple[float, float], box: Tuple[int, int, int, int]) -> bool:
+    px, py = pt
+    x1, y1, x2, y2 = box
+    return x1 <= px <= x2 and y1 <= py <= y2
+
+
+def _best_parent_index(
+    child: Tuple[int, int, int, int],
+    parents: List[Tuple[int, int, int, int]],
+    min_ioa: float,
+) -> Optional[int]:
+    """Return the parent index with highest IoA above *min_ioa*, else None."""
+    best_idx = -1
+    best_score = 0.0
+    for idx, parent_box in enumerate(parents):
+        score = _ioa(child, parent_box)
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    if best_idx >= 0 and best_score >= min_ioa:
+        return best_idx
+    return None
+
+
 # ── Thread ─────────────────────────────────────────────────────────────────────
 
 class TrackerLogicThread(QtCore.QThread):
@@ -73,6 +104,8 @@ class TrackerLogicThread(QtCore.QThread):
             "helmets": 0,
             "footwear": 0,
             "improper_footwear": 0,
+            "helmet_unknown": 0,
+            "footwear_unknown": 0,
             "no_helmet": 0,
             "footwear_compliant": 0,
             "overloaded_motos": 0,
@@ -135,20 +168,16 @@ class TrackerLogicThread(QtCore.QThread):
             # ── Associate riders ↔ motorcycles (IoA) ──────────────────────
             moto_boxes = [(d.x1, d.y1, d.x2, d.y2) for d in motorcycles]
             moto_rider_map: Dict[int, List[Detection]] = {i: [] for i in range(len(motorcycles))}
-            unmatched_riders: List[Detection] = []
 
             for rider in riders:
                 rbox = (rider.x1, rider.y1, rider.x2, rider.y2)
-                best_idx, best_ioa = -1, 0.0
-                for mi, mbox in enumerate(moto_boxes):
-                    score = _ioa(rbox, mbox)
-                    if score > best_ioa:
-                        best_ioa = score
-                        best_idx = mi
-                if best_idx >= 0 and best_ioa >= cfg.rider_moto_ioa_thresh:
+                best_idx = _best_parent_index(
+                    rbox,
+                    moto_boxes,
+                    cfg.rider_moto_ioa_thresh,
+                )
+                if best_idx is not None:
                     moto_rider_map[best_idx].append(rider)
-                else:
-                    unmatched_riders.append(rider)
 
             # ── Associate gear ↔ riders (IoA) ─────────────────────────────
             matched_riders: List[Detection] = []
@@ -160,27 +189,48 @@ class TrackerLogicThread(QtCore.QThread):
                 rider_gear[ri] = {"helmet": False, "footwear_ok": False, "improper_fw": False}
 
             rboxes = [(r.x1, r.y1, r.x2, r.y2) for r in matched_riders]
+            matched_helmets: List[Detection] = []
+            matched_footwear: List[Detection] = []
+            matched_improper_fw: List[Detection] = []
 
             for h in helmets:
                 hbox = (h.x1, h.y1, h.x2, h.y2)
-                for ri, rbox in enumerate(rboxes):
-                    if _ioa(hbox, rbox) >= cfg.gear_rider_ioa_thresh:
-                        rider_gear[ri]["helmet"] = True
-                        break
+                best_ri = _best_parent_index(hbox, rboxes, cfg.gear_rider_ioa_thresh)
+                if best_ri is None and rboxes:
+                    hc = _box_center(hbox)
+                    for ri, rbox in enumerate(rboxes):
+                        if _point_in_box(hc, rbox):
+                            best_ri = ri
+                            break
+                if best_ri is not None:
+                    rider_gear[best_ri]["helmet"] = True
+                    matched_helmets.append(h)
 
             for fw in footwear:
                 fbox = (fw.x1, fw.y1, fw.x2, fw.y2)
-                for ri, rbox in enumerate(rboxes):
-                    if _ioa(fbox, rbox) >= cfg.gear_rider_ioa_thresh:
-                        rider_gear[ri]["footwear_ok"] = True
-                        break
+                best_ri = _best_parent_index(fbox, rboxes, cfg.gear_rider_ioa_thresh)
+                if best_ri is None and rboxes:
+                    fc = _box_center(fbox)
+                    for ri, rbox in enumerate(rboxes):
+                        if _point_in_box(fc, rbox):
+                            best_ri = ri
+                            break
+                if best_ri is not None:
+                    rider_gear[best_ri]["footwear_ok"] = True
+                    matched_footwear.append(fw)
 
             for ifw in improper_fw:
                 ifbox = (ifw.x1, ifw.y1, ifw.x2, ifw.y2)
-                for ri, rbox in enumerate(rboxes):
-                    if _ioa(ifbox, rbox) >= cfg.gear_rider_ioa_thresh:
-                        rider_gear[ri]["improper_fw"] = True
-                        break
+                best_ri = _best_parent_index(ifbox, rboxes, cfg.gear_rider_ioa_thresh)
+                if best_ri is None and rboxes:
+                    ic = _box_center(ifbox)
+                    for ri, rbox in enumerate(rboxes):
+                        if _point_in_box(ic, rbox):
+                            best_ri = ri
+                            break
+                if best_ri is not None:
+                    rider_gear[best_ri]["improper_fw"] = True
+                    matched_improper_fw.append(ifw)
 
             # ── Check OVERLOAD (> max riders per motorcycle) ──────────────
             overloaded_motos: Set[int] = set()
@@ -192,11 +242,23 @@ class TrackerLogicThread(QtCore.QThread):
             total_riders = len(matched_riders)
             helmeted = sum(1 for g in rider_gear.values() if g["helmet"])
             fw_ok = sum(1 for g in rider_gear.values() if g["footwear_ok"] and not g["improper_fw"])
+            fw_unknown = sum(1 for g in rider_gear.values() if (not g["footwear_ok"]) and (not g["improper_fw"]))
+            helmet_unknown = total_riders - helmeted
+            improper_riders = sum(1 for g in rider_gear.values() if g["improper_fw"])
             overloaded_rider_ids = {
                 id(r)
                 for mi in overloaded_motos
                 for r in moto_rider_map[mi]
             }
+
+            compliant_riders = 0
+            for ri, rider in enumerate(matched_riders):
+                # Count as compliant only when evidence for both helmet and proper footwear exists.
+                if id(rider) in overloaded_rider_ids:
+                    continue
+                g = rider_gear.get(ri, {})
+                if g.get("helmet") and g.get("footwear_ok") and not g.get("improper_fw"):
+                    compliant_riders += 1
 
             stats = {
                 "motorcycles": len(motorcycles),
@@ -204,11 +266,15 @@ class TrackerLogicThread(QtCore.QThread):
                 "helmets": len(helmets),
                 "footwear": len(footwear),
                 "improper_footwear": len(improper_fw),
-                "no_helmet": total_riders - helmeted,
+                "helmet_unknown": helmet_unknown,
+                "footwear_unknown": fw_unknown,
+                # No explicit "no helmet" detector exists, so avoid defaulting unknown to violation.
+                "no_helmet": 0,
                 "footwear_compliant": fw_ok,
                 "overloaded_motos": len(overloaded_motos),
                 "overload_riders": sum(len(moto_rider_map[mi]) for mi in overloaded_motos),
-                "compliant_riders": helmeted,
+                "compliant_riders": compliant_riders,
+                "improper_footwear_riders": improper_riders,
                 "invalid_detections": len(invalid),
             }
             last_stats = stats
@@ -239,22 +305,27 @@ class TrackerLogicThread(QtCore.QThread):
                 # Riders (with compliance status)
                 for ri, rider in enumerate(matched_riders):
                     gear = rider_gear.get(ri, {})
-                    issues: List[str] = []
-                    if not gear.get("helmet"):
-                        issues.append("NO HELMET")
+                    violations: List[str] = []
+                    unknowns: List[str] = []
                     if gear.get("improper_fw"):
-                        issues.append("BAD FOOTWEAR")
-                    elif not gear.get("footwear_ok"):
-                        issues.append("NO FOOTWEAR")
+                        violations.append("BAD FOOTWEAR")
+
+                    # Missing detections are treated as UNKNOWN, not automatic violations.
+                    if not gear.get("helmet"):
+                        unknowns.append("HELMET ?")
+                    if (not gear.get("footwear_ok")) and (not gear.get("improper_fw")):
+                        unknowns.append("FOOTWEAR ?")
 
                     # Check if on overloaded motorcycle
                     on_overloaded = id(rider) in overloaded_rider_ids
 
                     if on_overloaded:
                         color = COLOR_OVERLOAD_BGR
-                        issues.insert(0, "OVERLOAD")
-                    elif issues:
+                        violations.insert(0, "OVERLOAD")
+                    elif violations:
                         color = COLOR_NON_COMPLIANT_BGR
+                    elif unknowns:
+                        color = COLOR_UNKNOWN_BGR
                     else:
                         color = COLOR_COMPLIANT_BGR
 
@@ -264,20 +335,28 @@ class TrackerLogicThread(QtCore.QThread):
                         annotated, f"Rider{tid_str} {rider.confidence:.2f}",
                         rider.x1, rider.y1, color,
                     )
-                    if issues:
+                    if violations or unknowns:
+                        status_txt = " | ".join(violations + unknowns)
+                        status_color = color if violations else COLOR_UNKNOWN_BGR
                         cv2.putText(
-                            annotated, " | ".join(issues),
+                            annotated, status_txt,
                             (rider.x1, rider.y2 + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, status_color, 2, cv2.LINE_AA,
                         )
 
-                # Gear boxes
+                # Gear boxes: always draw raw detections so footwear/improper detections stay visible.
+                assoc_ids = {
+                    id(d) for d in (matched_helmets + matched_footwear + matched_improper_fw)
+                }
                 for d in helmets + footwear + improper_fw:
                     color = class_colors.get(d.class_id, CLASS_COLORS_BGR.get(d.class_id, (255, 255, 255)))
-                    cv2.rectangle(annotated, (d.x1, d.y1), (d.x2, d.y2), color, 1)
+                    is_assoc = id(d) in assoc_ids
+                    thickness = 2 if is_assoc else 1
+                    suffix = "" if is_assoc else " ?"
+                    cv2.rectangle(annotated, (d.x1, d.y1), (d.x2, d.y2), color, thickness)
                     _draw_label(
                         annotated,
-                        f"{CLASS_NAMES.get(d.class_id, '?')} {d.confidence:.2f}",
+                        f"{CLASS_NAMES.get(d.class_id, '?')}{suffix} {d.confidence:.2f}",
                         d.x1, d.y1, color,
                     )
 

@@ -102,20 +102,25 @@ class InferenceThread(QtCore.QThread):
             return bool(self._rt.has_openvino)
         return True
 
+    def _create_model(self, path: str) -> YOLO:
+        """Instantiate a YOLO model and apply runtime device/precision policy."""
+        model = YOLO(path, task="detect", verbose=False)
+        if self._can_move_to_device(path):
+            model.to(self._device)
+            if self._fp16:
+                try:
+                    model.model.half()
+                except Exception:
+                    pass
+        return model
+
     def _try_rebind_fallback_model(self, cid: int, reason: str = "") -> bool:
         cur = self._model_paths.get(cid)
         fb = self._fallback_model_path(cur or "")
         if not fb or not self._path_exists(fb):
             return False
         try:
-            model = YOLO(fb, task="detect", verbose=False)
-            if self._can_move_to_device(fb):
-                model.to(self._device)
-                if self._fp16:
-                    try:
-                        model.model.half()
-                    except Exception:
-                        pass
+            model = self._create_model(fb)
             self._models[cid] = model
             self._model_paths[cid] = fb
             self._state.model_paths[cid] = fb
@@ -160,14 +165,7 @@ class InferenceThread(QtCore.QThread):
             tag = os.path.basename(path)
             self.status.emit(f"Loading {name}: {tag}")
             try:
-                model = YOLO(path, task="detect", verbose=False)
-                if self._can_move_to_device(path):
-                    model.to(self._device)
-                    if self._fp16:
-                        try:
-                            model.model.half()
-                        except Exception:
-                            pass
+                model = self._create_model(path)
                 self._models[cid] = model
                 self._model_paths[cid] = path
             except Exception as exc:
@@ -178,14 +176,7 @@ class InferenceThread(QtCore.QThread):
                         f"{name}: failed loading {tag}, fallback to {fb_tag}"
                     )
                     try:
-                        model = YOLO(fb, task="detect", verbose=False)
-                        if self._can_move_to_device(fb):
-                            model.to(self._device)
-                            if self._fp16:
-                                try:
-                                    model.model.half()
-                                except Exception:
-                                    pass
+                        model = self._create_model(fb)
                         self._models[cid] = model
                         self._model_paths[cid] = fb
                         self._state.model_paths[cid] = fb

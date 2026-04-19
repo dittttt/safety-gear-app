@@ -10,7 +10,7 @@ from __future__ import annotations
 import queue
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -105,6 +105,7 @@ class PipelineState:
         self.video_fps: float = 0.0
         self.total_frames: int = 0
         self.video_path: Optional[str] = None
+        self.camera_source: Optional[Dict[str, Any]] = None
 
     # ── Queue helpers ──────────────────────────────────────────────────────────
 
@@ -248,3 +249,26 @@ class PipelineState:
     def get_class_colors(self) -> Dict[int, Tuple[int, int, int]]:
         with self._lock:
             return dict(self.class_colors_bgr)
+
+    # ── Source helpers ───────────────────────────────────────────────────────
+
+    def get_source(self) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Return current (video_path, camera_source)."""
+        with self._lock:
+            return self.video_path, dict(self.camera_source) if self.camera_source else None
+
+    def has_source(self) -> bool:
+        with self._lock:
+            return bool(self.video_path) or self.camera_source is not None
+
+    def set_video_source(self, path: Optional[str]) -> None:
+        with self._lock:
+            self.video_path = path if path else None
+            if self.video_path:
+                self.camera_source = None
+
+    def set_camera_source(self, source: Optional[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.camera_source = dict(source) if source else None
+            if self.camera_source is not None:
+                self.video_path = None

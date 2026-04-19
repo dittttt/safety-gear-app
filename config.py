@@ -65,7 +65,7 @@ class DetectionConfig:
     use_fp16: bool = False
     device: str = "auto"
     rider_moto_ioa_thresh: float = 0.05
-    gear_rider_ioa_thresh: float = 0.20
+    gear_rider_ioa_thresh: float = 0.10
     occlusion_conf_thresh: float = 0.15
     max_riders_per_motorcycle: int = 2
     tracker_key: str = "botsort"

@@ -5,21 +5,21 @@ True fullscreen with auto-hiding transport controls.
 """
 from __future__ import annotations
 import os, queue, tempfile
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
 import cv2, numpy as np, qtawesome as qta
-import torch
 from PyQt5 import QtCore, QtGui, QtWidgets
-from config import (TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS,
-                    MODEL_EXTENSIONS, DEFAULT_MODEL_FILES)
-from utils.model_registry import (discover_models, model_dir_for,
-                                   _detect_format, _FORMAT_LABEL)
+from config import TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS, MODEL_EXTENSIONS
+from utils.model_registry import discover_models, _detect_format, _FORMAT_LABEL
 from pipeline.state import PipelineState
-from pipeline.frame_grabber import FrameGrabberThread
-from pipeline.inference_engine import InferenceThread
-from pipeline.tracker_logic import TrackerLogicThread
-from pipeline.convert_worker import ConvertWorker
 from utils.runtime_check import detect as _detect_runtimes
+from utils.camera_devices import discover_camera_devices, open_camera_capture
 from gui.widgets import VideoDropLabel, SeekSlider
+
+if TYPE_CHECKING:
+    from pipeline.frame_grabber import FrameGrabberThread
+    from pipeline.inference_engine import InferenceThread
+    from pipeline.tracker_logic import TrackerLogicThread
+    from pipeline.convert_worker import ConvertWorker
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -39,7 +39,9 @@ _FS_ICON_SIZE = int(16 * _S)
 _STAT_ITEMS = (
     ("motorcycles", "Motos"),
     ("riders", "Riders"),
-    ("no_helmet", "No Helmet"),
+    ("helmet_unknown", "Helmet ?"),
+    ("footwear_unknown", "Footwear ?"),
+    ("improper_footwear", "Bad Footwear"),
     ("overloaded_motos", "Overload"),
     ("invalid_detections", "Occluded"),
 )
@@ -99,9 +101,28 @@ class _AlignedComboBox(QtWidgets.QComboBox):
         if chosen is not None:
             self.setCurrentIndex(chosen.data())
 
-        lay.addStretch()
-        scroll.setWidget(content); outer.addWidget(scroll)
-        return sb
+
+class _CameraScanThread(QtCore.QThread):
+    """Background camera discovery to keep UI responsive."""
+
+    completed = QtCore.pyqtSignal(list)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        max_index: int = 8,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._max_index = max(1, int(max_index))
+
+    def run(self) -> None:
+        try:
+            devices = discover_camera_devices(max_index=self._max_index)
+            payload = [d.to_dict() for d in devices]
+            self.completed.emit(payload)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 def _qss(s: float, chk: str) -> str:
     """Full stylesheet – every pixel value multiplied by *s*."""
@@ -268,9 +289,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chk = self._make_checkmark_icon()
         self._state = PipelineState()
         self._state.set_overlay_enabled(True)
-        self._grabber: Optional[FrameGrabberThread] = None
-        self._inferencer: Optional[InferenceThread] = None
-        self._tracker: Optional[TrackerLogicThread] = None
+        self._grabber: Optional["FrameGrabberThread"] = None
+        self._inferencer: Optional["InferenceThread"] = None
+        self._tracker: Optional["TrackerLogicThread"] = None
         self._timer = QtCore.QTimer(self, interval=16)
         self._timer.timeout.connect(self._poll_display)
         self._video_fps = self._current_fps = 0.0
@@ -282,8 +303,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # fullscreen state
         self._is_fs = False
         self._fs_hide = QtCore.QTimer(self)
+        self._cam_scan: Optional[_CameraScanThread] = None
         # model conversion worker
-        self._converter: Optional[ConvertWorker] = None
+        self._converter: Optional["ConvertWorker"] = None
         self._cvt_t0: float = 0.0          # monotonic start time of conversion
         self._cvt_label: str = ""           # last "Converting X → Y" message
         # model registry state
@@ -300,6 +322,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_shortcuts()
         self.setStyleSheet(_qss(_S, self._chk))
         self._auto_load_models()
+        QtCore.QTimer.singleShot(120, self._refresh_camera_devices)
         self._timer.start()
 
     # ── helpers ───────────────────────────────────────────────────────────
@@ -340,6 +363,12 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _to_bgr_tuple(color: QtGui.QColor) -> tuple[int, int, int]:
         return (color.blue(), color.green(), color.red())
+
+    def _has_cuda(self) -> bool:
+        return bool(_detect_runtimes().has_cuda)
+
+    def _has_active_source(self) -> bool:
+        return self._state.has_source()
 
     def _video_scale_mode(self) -> QtCore.Qt.AspectRatioMode:
         """Prefer fill mode for near-16:9 sources to avoid pillar bars."""
@@ -624,6 +653,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._vfWidget.setFixedHeight(int(28 * _S))
         self._vfWidget.setVisible(False)
         lay.addWidget(self._vfWidget)
+
+        cam_lbl = QtWidgets.QLabel("Live Camera")
+        cam_lbl.setObjectName("sliderLabel")
+        lay.addWidget(cam_lbl)
+
+        cam_row = QtWidgets.QHBoxLayout()
+        cam_row.setContentsMargins(0, 0, 0, 0)
+        cam_row.setSpacing(int(6 * _S))
+        self.camCombo = _AlignedComboBox()
+        self.camCombo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.camCombo.setMinimumContentsLength(0)
+        self.camCombo.addItem("None", {"type": "none"})
+        cam_row.addWidget(self.camCombo, stretch=1)
+
+        cam_btn_sz = int(22 * _S)
+        cam_icon_sz = int(11 * _S)
+        self.btnRefreshCams = QtWidgets.QPushButton()
+        self.btnRefreshCams.setObjectName("iconBtn")
+        self.btnRefreshCams.setFlat(True)
+        self.btnRefreshCams.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnRefreshCams.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btnRefreshCams.setToolTip("Refresh camera list")
+        self.btnRefreshCams.setIcon(_fa("sync-alt", _TD, cam_icon_sz))
+        self.btnRefreshCams.setIconSize(QtCore.QSize(cam_icon_sz, cam_icon_sz))
+        self.btnRefreshCams.setFixedSize(cam_btn_sz, cam_btn_sz)
+        cam_row.addWidget(self.btnRefreshCams, 0, QtCore.Qt.AlignVCenter)
+
+        lay.addLayout(cam_row)
         lay.addSpacing(int(6 * _S))
 
         # MODELS
@@ -903,7 +962,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._seekPrev.hide()
 
         if obj is self.videoDisplay and etype == QtCore.QEvent.MouseButtonPress:
-            if event.button() == QtCore.Qt.LeftButton and self._state.video_path:
+            if event.button() == QtCore.Qt.LeftButton and self._has_active_source():
                 self._on_play_pause()
                 return True
         return super().eventFilter(obj, event)
@@ -949,6 +1008,103 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_video_ui_state(self, loaded: bool) -> None:
         self.btnLoadVideo.setVisible(not loaded)
         self._vfWidget.setVisible(loaded)
+
+    def _set_source_label(self, text: str, tooltip: str) -> None:
+        self.lblVidName.setText(text)
+        self.lblVidName.setToolTip(tooltip)
+        self._set_video_ui_state(True)
+
+    def _set_camera_combo_none(self) -> None:
+        if self.camCombo.count() <= 0:
+            return
+        self.camCombo.blockSignals(True)
+        self.camCombo.setCurrentIndex(0)
+        self.camCombo.blockSignals(False)
+
+    def _refresh_camera_devices(self) -> None:
+        if self._cam_scan and self._cam_scan.isRunning():
+            return
+        self.camCombo.setEnabled(False)
+        self.btnRefreshCams.setEnabled(False)
+        self.btnRefreshCams.setIcon(_fa("spinner", "#FFC107", int(11 * _S)))
+
+        self._cam_scan = _CameraScanThread(max_index=8, parent=self)
+        self._cam_scan.completed.connect(self._on_camera_scan_completed)
+        self._cam_scan.failed.connect(self._on_camera_scan_failed)
+        self._cam_scan.start()
+
+    def _on_camera_scan_completed(self, devices: list) -> None:
+        prev_data = self.camCombo.currentData() or {}
+        prev_key = None
+        if isinstance(prev_data, dict):
+            prev_cam = prev_data.get("camera") if prev_data.get("type") == "camera" else None
+            if isinstance(prev_cam, dict):
+                prev_key = prev_cam.get("key")
+        _path, active_cam = self._state.get_source()
+        active_key = active_cam.get("key") if isinstance(active_cam, dict) else None
+
+        self.camCombo.blockSignals(True)
+        self.camCombo.clear()
+        self.camCombo.addItem("None", {"type": "none"})
+        selected_idx = 0
+        seen_keys = set()
+        for i, dev in enumerate(devices, start=1):
+            if not isinstance(dev, dict):
+                continue
+            key = str(dev.get("key") or "")
+            label = str(dev.get("label") or "Camera")
+            if not key:
+                continue
+            self.camCombo.addItem(label, {"type": "camera", "camera": dev})
+            seen_keys.add(key)
+            if prev_key is not None and key == str(prev_key):
+                selected_idx = i
+
+        if isinstance(active_cam, dict) and active_key and active_key not in seen_keys:
+            fallback_label = str(active_cam.get("label") or "Active Camera") + " (in use)"
+            self.camCombo.addItem(
+                fallback_label,
+                {
+                    "type": "camera",
+                    "camera": {
+                        **active_cam,
+                        "label": fallback_label,
+                    },
+                },
+            )
+            if prev_key is None or str(prev_key) == str(active_key):
+                selected_idx = self.camCombo.count() - 1
+
+        self.camCombo.setCurrentIndex(selected_idx)
+        self.camCombo.blockSignals(False)
+
+        self.camCombo.setEnabled(True)
+        self.btnRefreshCams.setEnabled(True)
+        self.btnRefreshCams.setIcon(_fa("sync-alt", _TD, int(11 * _S)))
+
+    def _on_camera_scan_failed(self, message: str) -> None:
+        self.camCombo.setEnabled(True)
+        self.btnRefreshCams.setEnabled(True)
+        self.btnRefreshCams.setIcon(_fa("sync-alt", _TD, int(11 * _S)))
+        self._set_status(f"Camera scan failed: {message}")
+
+    def _on_camera_combo_changed(self) -> None:
+        data = self.camCombo.currentData() or {}
+        kind = data.get("type") if isinstance(data, dict) else "none"
+        if kind == "none":
+            _path, cam = self._state.get_source()
+            if cam is not None:
+                self._on_close_video()
+            return
+
+        if kind == "camera":
+            cam = data.get("camera") if isinstance(data, dict) else None
+            if isinstance(cam, dict):
+                _path, active_cam = self._state.get_source()
+                if isinstance(active_cam, dict) and active_cam.get("key") == cam.get("key"):
+                    return
+                label = str(cam.get("label") or "Camera")
+                self._open_camera(cam, label)
 
     # ── fullscreen ────────────────────────────────────────────────────────
 
@@ -1012,6 +1168,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _connect_signals(self) -> None:
         self.btnLoadVideo.clicked.connect(self._on_load_video)
         self.btnCloseVid.clicked.connect(self._on_close_video)
+        self.camCombo.currentIndexChanged.connect(self._on_camera_combo_changed)
+        self.btnRefreshCams.clicked.connect(self._refresh_camera_devices)
         for cid, combo in self._mcombo.items():
             combo.currentIndexChanged.connect(
                 lambda idx, c=cid: self._on_model_combo_changed(c))
@@ -1115,7 +1273,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_status(f"Set all models to {label}")
 
     def _step_forward(self) -> None:
-        if self._state.video_path:
+        path, _cam = self._state.get_source()
+        if path:
             self._skip(1 / max(self._video_fps, 1))
 
     # ── auto-load models ──────────────────────────────────────────────────
@@ -1128,7 +1287,7 @@ class MainWindow(QtWidgets.QMainWindow):
             group = self._model_groups.get(cid)
             if group and group.variants:
                 loaded.append(CLASS_NAMES[cid])
-        use_cuda = torch.cuda.is_available()
+        use_cuda = self._has_cuda()
         default_imgsz = 320 if use_cuda else 256
         default_stride = 1 if use_cuda else 2
         default_batch = 4 if use_cuda else 2
@@ -1146,7 +1305,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(
             f"Auto-loaded: {', '.join(loaded)}" if loaded
             else "No default models found \u2014 load via sidebar")
-        self._update_convert_buttons()
+        QtCore.QTimer.singleShot(0, self._update_convert_buttons)
         self._update_model_format_labels()
 
     # ── video / model loading ─────────────────────────────────────────────
@@ -1167,7 +1326,7 @@ class MainWindow(QtWidgets.QMainWindow):
         raw = str(self.deviceCombo.currentData() or "auto").lower()
         if raw == "cpu":
             return "cpu"
-        if raw in ("cuda", "auto") and torch.cuda.is_available():
+        if raw in ("cuda", "auto") and self._has_cuda():
             return "cuda"
         return "cpu"
 
@@ -1354,19 +1513,55 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_frame(frame)
             fh, fw = frame.shape[:2]
             self._fit_window_to_video_aspect(fw, fh)
-        self._state.video_path = path
+        self._state.set_video_source(path)
         self._video_fps, self._total_frames = float(fps), total
         self._init_seek()
+        self.lblTime.setText("0:00")
         bn = os.path.basename(path)
-        self.lblVidName.setText(bn); self.lblVidName.setToolTip(path)
-        self._set_video_ui_state(True)
+        self._set_source_label(bn, path)
+        self._set_camera_combo_none()
         self._set_status(
             f"Loaded: {bn}  \u00b7  "
             f"{self._fmt(total / fps if fps else 0)} @ {fps:.1f} FPS")
 
+    def _open_camera(self, camera: dict, label: str) -> None:
+        self._on_stop()
+        cap = open_camera_capture(camera)
+        if not cap.isOpened():
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f"Cannot open camera:\n{label}")
+            self._set_camera_combo_none()
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f"Camera is not producing frames:\n{label}")
+            self._set_camera_combo_none()
+            return
+
+        if self._preview_cap is not None:
+            self._preview_cap.release()
+        self._preview_cap = None
+
+        self._show_frame(frame)
+        fh, fw = frame.shape[:2]
+        self._fit_window_to_video_aspect(fw, fh)
+
+        self._state.set_camera_source(camera)
+        self._video_fps = float(fps)
+        self._total_frames = 0
+        self._init_seek()
+        self.lblTime.setText("0:00")
+        self._set_source_label(label, str(camera.get("target") or label))
+        self._set_status(f"Loaded: {label}  \u00b7  Live @ {fps:.1f} FPS")
+
     def _on_play_pause(self) -> None:
-        if not self._state.video_path:
-            self._set_status("Load a video first"); return
+        if not self._has_active_source():
+            self._set_status("Load a video or select a camera first")
+            return
         if self._is_playing:
             self._state.pause_event.set(); self._is_playing = False
             self.btnPlay.setIcon(self._ico_play)
@@ -1393,7 +1588,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._preview_cap is not None:
             self._preview_cap.release(); self._preview_cap = None
         self._seekPrev.hide()
-        self._state.video_path = None
+        self._state.set_video_source(None)
+        self._state.set_camera_source(None)
         self._video_fps = self._total_frames = 0
         self.seekSlider.setRange(0, 0); self.seekSlider.setEnabled(False)
         self.lblTime.setText("0:00"); self.lblTotal.setText("0:00")
@@ -1402,11 +1598,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.videoDisplay.setText(_DROP_PROMPT)
         self.lblVidName.setText(""); self.lblVidName.setToolTip("")
         self._set_video_ui_state(False)
+        self._set_camera_combo_none()
         self._set_status("Ready")
 
     def _ensure_pipeline(self) -> None:
         if self._grabber and self._grabber.isRunning():
             return
+
+        from pipeline.frame_grabber import FrameGrabberThread
+        from pipeline.inference_engine import InferenceThread
+        from pipeline.tracker_logic import TrackerLogicThread
+
         self._state.stop_event.clear(); self._state.pause_event.clear()
         self._state.flush_queues(); self._state.reset_tracker_flag = True
         self._grabber = FrameGrabberThread(self._state, parent=self)
@@ -1427,7 +1629,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── seek / skip ───────────────────────────────────────────────────────
 
     def _skip(self, seconds: float) -> None:
-        if self._video_fps <= 0:
+        path, _cam = self._state.get_source()
+        if not path or self._video_fps <= 0 or self._total_frames <= 1:
             return
         t = max(0, min(self.seekSlider.value()
                        + int(seconds * self._video_fps),
@@ -1435,6 +1638,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._state.request_seek(t)
 
     def _on_seek_released(self) -> None:
+        path, _cam = self._state.get_source()
+        if not path:
+            self._user_seeking = False
+            return
         self._user_seeking = False
         self._state.request_seek(self.seekSlider.value())
 
@@ -1445,7 +1652,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── seek preview ──────────────────────────────────────────────────────
 
     def _on_seek_hover(self, x: int) -> None:
-        if not self._state.video_path or self._total_frames <= 0:
+        path, _cam = self._state.get_source()
+        if not path or self._total_frames <= 0:
             self._seekPrev.hide(); return
         w = self.seekSlider.width()
         if w <= 0:
@@ -1490,17 +1698,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_meta(self, fps: float, total: int) -> None:
         if fps > 0:
             self._video_fps = float(fps)
-        if total > 0:
-            self._total_frames = int(total)
+        self._total_frames = max(0, int(total))
         self._init_seek()
 
     def _on_position(self, idx: int, ts: float) -> None:
         if self._user_seeking:
             return
-        self.seekSlider.blockSignals(True)
-        self.seekSlider.setValue(idx)
-        self.seekSlider.blockSignals(False)
-        self.lblTime.setText(self._fmt(ts))
+        if self.seekSlider.isEnabled():
+            self.seekSlider.blockSignals(True)
+            self.seekSlider.setValue(idx)
+            self.seekSlider.blockSignals(False)
+        display_ts = ts if ts > 0 else (idx / self._video_fps if self._video_fps > 0 else 0.0)
+        self.lblTime.setText(self._fmt(display_ts))
 
     def _on_fps(self, fps: float) -> None:
         self._current_fps = fps
@@ -1565,7 +1774,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_convert_buttons(self) -> None:
         """Show / hide per-model convert buttons and the Optimize-All button."""
         rt = _detect_runtimes()
-        has_cuda = torch.cuda.is_available()
+        has_cuda = self._has_cuda()
 
         any_eligible = False
         for cid in TARGET_CLASS_IDS:
@@ -1619,7 +1828,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if cids is None:
             cids = TARGET_CLASS_IDS
         imgsz = self._state.get_imgsz()
-        has_cuda = torch.cuda.is_available()
+        has_cuda = self._has_cuda()
         jobs = []
 
         for cid in cids:
@@ -1652,7 +1861,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         rt = _detect_runtimes()
         parts = []
-        if torch.cuda.is_available():
+        if self._has_cuda():
             parts.append(rt.gpu_summary)
         parts.append(rt.cpu_summary)
         self._set_status("Starting conversion · " + " | ".join(parts))
@@ -1666,7 +1875,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         rt = _detect_runtimes()
         parts = []
-        if torch.cuda.is_available():
+        if self._has_cuda():
             parts.append(rt.gpu_summary)
         parts.append(rt.cpu_summary)
         self._set_status("Batch conversion started · " + " | ".join(parts))
@@ -1676,6 +1885,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._converter and self._converter.isRunning():
             self._set_status("A conversion is already running — please wait")
             return
+
+        from pipeline.convert_worker import ConvertWorker
+
         self._converter = ConvertWorker(jobs)   # no parent — we manage lifetime
         self._converter.conversion_started.connect(self._on_cvt_started)
         self._converter.conversion_progress.connect(self._on_cvt_progress)
@@ -1773,6 +1985,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.seekSlider.setEnabled(False)
             self.seekSlider.setRange(0, 0)
+            self.lblTotal.setText("0:00")
         if self._video_fps > 0 and self._total_frames > 0:
             self.lblTotal.setText(
                 self._fmt((self._total_frames - 1) / self._video_fps))
@@ -1797,6 +2010,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, e):
         self._on_stop()
+        if self._cam_scan and self._cam_scan.isRunning():
+            self._cam_scan.wait(2000)
         # Stop conversion worker before closing (avoids crash from live QThread)
         if self._converter and self._converter.isRunning():
             self._cvt_timer.stop()
