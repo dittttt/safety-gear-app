@@ -40,7 +40,9 @@ class FrameGrabberThread(QtCore.QThread):
             return
 
         # Keep FFmpeg warnings quiet during frequent random-access seeks.
-        os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
+        # Using "-8" (quiet) silences the H.264 "reference picture missing"
+        # spam that appears after every seek to a non-keyframe.
+        os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
         if is_live_camera:
             cap = open_camera_capture(camera_source)
@@ -56,6 +58,14 @@ class FrameGrabberThread(QtCore.QThread):
             self.error.emit(f"Cannot open: {src_name}")
             return
 
+        if is_live_camera:
+            # Keep the OS / driver buffer as small as possible so we always
+            # display the most recent frame instead of a queued stale one.
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total = 0 if is_live_camera else int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         state.video_fps = float(fps)
@@ -70,33 +80,46 @@ class FrameGrabberThread(QtCore.QThread):
             if not is_live_camera:
                 seek_target = state.consume_seek()
                 if seek_target is not None:
+                    # Coalesce a burst of seek requests — if the user is
+                    # still dragging the slider, several requests may be
+                    # queued.  Drain them and only honour the latest one.
+                    while True:
+                        latest = state.consume_seek()
+                        if latest is None:
+                            break
+                        seek_target = latest
+
                     state.flush_queues()
-                    # Decode from slightly before target to avoid H264 reference
-                    # picture issues on non-keyframe random seeks.
-                    warmup = max(2, int(fps * 0.5))
-                    start_idx = max(0, int(seek_target) - warmup)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
-                    frame_idx = start_idx
 
-                    while frame_idx < int(seek_target):
-                        if not cap.grab():
-                            self.finished_signal.emit()
-                            cap.release()
-                            return
-                        frame_idx += 1
+                    target = max(0, int(seek_target))
+                    if total > 0:
+                        target = min(target, max(0, total - 1))
 
+                    # Let FFmpeg do the keyframe-aligned seek itself.
+                    # POS_FRAMES set seeks to the previous keyframe and
+                    # decodes the B/P frames up to *target* internally,
+                    # which avoids the manual warmup loop (much faster) and
+                    # the "reference picture missing" decoder errors caused
+                    # by feeding the decoder an arbitrary mid-GOP start.
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, float(target))
+                    frame_idx = target
                     state.reset_tracker_flag = True
                     next_frame_time = time.perf_counter()
 
-                    # Always decode and publish one frame immediately after seek,
-                    # so UI updates instantly in both paused and playing states.
+                    # Decode and publish one frame immediately so the UI
+                    # updates instantly in both paused and playing states.
                     ok, frame = cap.read()
-                    if ok:
+                    if ok and frame is not None:
                         ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                         packet = FramePacket(index=frame_idx, frame=frame, timestamp_ms=ts_ms)
                         state.put_safe(state.frame_queue, packet)
                         self.positionChanged.emit(frame_idx, ts_ms / 1000.0 if ts_ms else 0.0)
                         frame_idx += 1
+                    elif total > 0:
+                        # Read failed at end of file — re-arm at the last
+                        # frame and continue without dying.
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, float(max(0, total - 1)))
+                        frame_idx = max(0, total - 1)
             else:
                 # Consume stale seek requests when source is a live camera.
                 state.consume_seek()
@@ -109,6 +132,11 @@ class FrameGrabberThread(QtCore.QThread):
 
             ok, frame = cap.read()
             if not ok:
+                if is_live_camera:
+                    # A transient camera read failure should not kill the
+                    # pipeline.  Back off briefly and try again.
+                    self.msleep(15)
+                    continue
                 self.finished_signal.emit()
                 break
 
@@ -122,6 +150,11 @@ class FrameGrabberThread(QtCore.QThread):
             frame_idx += 1
 
             # ── Playback pacing ────────────────────────────────────────────
+            if is_live_camera:
+                # Live cameras: never sleep — the camera itself paces us.
+                # Skip pacing & frame-skip logic entirely.
+                continue
+
             rate = state.get_playback_rate()
             frame_period = (1.0 / (fps * rate)) if fps > 0 and rate > 0 else 0.0
             if frame_period > 0.0:
@@ -138,6 +171,9 @@ class FrameGrabberThread(QtCore.QThread):
                 while True:
                     remaining = end_t - time.perf_counter()
                     if remaining <= 0:
+                        break
+                    # Wake immediately if paused or stopped.
+                    if state.pause_event.is_set() or state.stop_event.is_set():
                         break
                     if remaining > 0.003:
                         time.sleep(max(0.0, remaining - 0.001))

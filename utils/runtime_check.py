@@ -115,11 +115,11 @@ def detect() -> RuntimeInfo:
     info.has_onnx = bool(info.onnx_ver)
 
     # --- Choose best GPU format ---
-    if info.has_tensorrt:
+    if info.has_cuda:
         info.best_gpu_format = "engine"
         info.gpu_artifact_ext = ".engine"
         info.gpu_summary = (
-            f"TensorRT {info.tensorrt_ver} · CUDA {info.torch_cuda_ver}"
+            f"TensorRT (auto-install) · CUDA {info.torch_cuda_ver}"
             f" · {info.cuda_device}"
         )
     elif info.has_onnxruntime_gpu and info.has_onnx:
@@ -134,19 +134,10 @@ def detect() -> RuntimeInfo:
         info.gpu_summary = "PyTorch (no TRT/ONNX-GPU available)"
 
     # --- Choose best CPU format ---
-    if info.has_openvino:
-        info.best_cpu_format = "openvino"
-        info.cpu_artifact_subdir = "{stem}_openvino_model"
-        info.cpu_summary = f"OpenVINO {info.openvino_ver}"
-    elif info.has_onnx:
-        info.best_cpu_format = "onnx"
-        info.cpu_artifact_subdir = ""   # flat .onnx file in CPU dir
-        info.cpu_summary = f"ONNX {info.onnx_ver} (no OpenVINO)"
-    else:
-        info.best_cpu_format = "pt"
-        info.cpu_artifact_subdir = ""
-        info.cpu_summary = "PyTorch (no OpenVINO/ONNX available)"
-
+    info.best_cpu_format = "openvino"
+    info.cpu_artifact_subdir = "{stem}_openvino_model"
+    info.cpu_summary = f"OpenVINO (auto-install)"
+    
     return info
 
 

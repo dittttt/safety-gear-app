@@ -89,6 +89,14 @@ class TrackerLogicThread(QtCore.QThread):
     """Applies business rules and produces annotated display frames."""
 
     stats_ready = QtCore.pyqtSignal(dict)
+    # Emitted whenever a non-compliant rider is observed.  Payload is a
+    # plain dict so Qt can marshal it across threads without issues.
+    # Keys: violation_type ("no_helmet" | "improper_footwear" | "overload"),
+    #       motorcycle_id (int|None — tracker id of the bike),
+    #       rider_id (int|None — tracker id of the rider),
+    #       rider_count (int|None — only for "overload"),
+    #       confidence (float — rider detection confidence).
+    violation_detected = QtCore.pyqtSignal(dict)
 
     def __init__(self, state: PipelineState, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
@@ -241,10 +249,15 @@ class TrackerLogicThread(QtCore.QThread):
             # ── Build stats dict ──────────────────────────────────────────
             total_riders = len(matched_riders)
             helmeted = sum(1 for g in rider_gear.values() if g["helmet"])
+            no_helmet = sum(1 for g in rider_gear.values() if not g["helmet"])
+
             fw_ok = sum(1 for g in rider_gear.values() if g["footwear_ok"] and not g["improper_fw"])
-            fw_unknown = sum(1 for g in rider_gear.values() if (not g["footwear_ok"]) and (not g["improper_fw"]))
-            helmet_unknown = total_riders - helmeted
             improper_riders = sum(1 for g in rider_gear.values() if g["improper_fw"])
+            
+            # Since we only consider IMPROPER_footwear as non-compliant, missing both just means unknown but not strictly non-compliant
+            fw_unknown = sum(1 for g in rider_gear.values() if (not g["footwear_ok"]) and (not g["improper_fw"]))
+            helmet_unknown = 0 # According to rules, missing helmet = no_helmet
+
             overloaded_rider_ids = {
                 id(r)
                 for mi in overloaded_motos
@@ -253,24 +266,24 @@ class TrackerLogicThread(QtCore.QThread):
 
             compliant_riders = 0
             for ri, rider in enumerate(matched_riders):
-                # Count as compliant only when evidence for both helmet and proper footwear exists.
                 if id(rider) in overloaded_rider_ids:
                     continue
                 g = rider_gear.get(ri, {})
-                if g.get("helmet") and g.get("footwear_ok") and not g.get("improper_fw"):
+                # Helmet rule: compliant ONLY if helmet IS present
+                # Footwear rule: non-compliant ONLY if improper_fw is present
+                if g.get("helmet") and not g.get("improper_fw"):
                     compliant_riders += 1
 
             stats = {
                 "motorcycles": len(motorcycles),
                 "riders": total_riders,
-                "helmets": len(helmets),
-                "footwear": len(footwear),
-                "improper_footwear": len(improper_fw),
+                "helmets": len(matched_helmets),
+                "footwear": len(matched_footwear),
+                "improper_footwear": len(matched_improper_fw),
                 "helmet_unknown": helmet_unknown,
                 "footwear_unknown": fw_unknown,
-                # No explicit "no helmet" detector exists, so avoid defaulting unknown to violation.
-                "no_helmet": 0,
-                "footwear_compliant": fw_ok,
+                "no_helmet": no_helmet,
+                "footwear_compliant": fw_ok + fw_unknown, # OK or strictly not improper
                 "overloaded_motos": len(overloaded_motos),
                 "overload_riders": sum(len(moto_rider_map[mi]) for mi in overloaded_motos),
                 "compliant_riders": compliant_riders,
@@ -278,6 +291,50 @@ class TrackerLogicThread(QtCore.QThread):
                 "invalid_detections": len(invalid),
             }
             last_stats = stats
+
+            # ── Emit per-motorcycle violation events ──────────────────────
+            # We key dedup by motorcycle.track_id (stable across frames),
+            # so the GUI / Supabase logger only fires once per offence.
+            for mi, rider_list in moto_rider_map.items():
+                moto = motorcycles[mi]
+                moto_tid = moto.track_id  # may be None if tracker missing
+
+                if mi in overloaded_motos:
+                    self.violation_detected.emit({
+                        "violation_type": "overload",
+                        "motorcycle_id": moto_tid,
+                        "rider_id": None,
+                        "rider_count": len(rider_list),
+                        "confidence": float(moto.confidence),
+                        "timestamp_ms": float(packet.timestamp_ms),
+                    })
+
+                # Map back rider→gear from matched_riders order.
+                for rider in rider_list:
+                    try:
+                        ri = matched_riders.index(rider)
+                    except ValueError:
+                        continue
+                    g = rider_gear.get(ri, {})
+                    rider_tid = rider.track_id
+                    if not g.get("helmet"):
+                        self.violation_detected.emit({
+                            "violation_type": "no_helmet",
+                            "motorcycle_id": moto_tid,
+                            "rider_id": rider_tid,
+                            "rider_count": None,
+                            "confidence": float(rider.confidence),
+                            "timestamp_ms": float(packet.timestamp_ms),
+                        })
+                    if g.get("improper_fw"):
+                        self.violation_detected.emit({
+                            "violation_type": "improper_footwear",
+                            "motorcycle_id": moto_tid,
+                            "rider_id": rider_tid,
+                            "rider_count": None,
+                            "confidence": float(rider.confidence),
+                            "timestamp_ms": float(packet.timestamp_ms),
+                        })
 
             # ── Annotate frame ────────────────────────────────────────────
             annotated = frame
@@ -344,15 +401,11 @@ class TrackerLogicThread(QtCore.QThread):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, status_color, 2, cv2.LINE_AA,
                         )
 
-                # Gear boxes: always draw raw detections so footwear/improper detections stay visible.
-                assoc_ids = {
-                    id(d) for d in (matched_helmets + matched_footwear + matched_improper_fw)
-                }
-                for d in helmets + footwear + improper_fw:
+                # Gear boxes: only draw associated ones
+                for d in matched_helmets + matched_footwear + matched_improper_fw:
                     color = class_colors.get(d.class_id, CLASS_COLORS_BGR.get(d.class_id, (255, 255, 255)))
-                    is_assoc = id(d) in assoc_ids
-                    thickness = 2 if is_assoc else 1
-                    suffix = "" if is_assoc else " ?"
+                    thickness = 2
+                    suffix = ""
                     cv2.rectangle(annotated, (d.x1, d.y1), (d.x2, d.y2), color, thickness)
                     _draw_label(
                         annotated,

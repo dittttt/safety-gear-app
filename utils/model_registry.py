@@ -233,6 +233,32 @@ def migrate_old_structure() -> bool:
 
 # ── discovery ────────────────────────────────────────────────────────────────
 
+def cleanup_onnx_artifacts() -> int:
+    """Remove every leftover ``.onnx`` file under ``models/``.
+
+    The convert pipeline used to keep ONNX intermediates around;  this
+    helper purges them so only ``.pt`` (PyTorch), ``.engine`` (TensorRT)
+    and OpenVINO IR directories remain.  Returns the number of files
+    deleted.
+    """
+    if not os.path.isdir(MODELS_DIR):
+        return 0
+    deleted = 0
+    for root, _dirs, files in os.walk(MODELS_DIR):
+        # Don't touch ONNX files that live inside an OpenVINO model dir
+        # (OpenVINO never emits one, but be safe).
+        if root.endswith("_openvino_model") or root.endswith("_OV_model"):
+            continue
+        for f in files:
+            if f.lower().endswith(".onnx"):
+                try:
+                    os.remove(os.path.join(root, f))
+                    deleted += 1
+                except OSError:
+                    pass
+    return deleted
+
+
 def discover_models() -> Dict[int, ModelGroup]:
     """
     Scan ``models/`` and return ``{class_id: ModelGroup}`` for every

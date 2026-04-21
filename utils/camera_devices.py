@@ -242,12 +242,11 @@ def discover_camera_devices(max_index: int = 8) -> List[CameraDevice]:
             cap.release()
 
             if ok:
-                suffix = f" ({width}x{height})" if width > 0 and height > 0 else ""
                 label = windows_name_hints[idx] if idx < len(windows_name_hints) else f"Camera {idx}"
                 devices.append(
                     CameraDevice(
                         key=f"idx:{idx}",
-                        label=f"{label}{suffix}",
+                        label=label,
                         target=idx,
                         backend=int(backend if backend is not None else cv2.CAP_ANY),
                     )

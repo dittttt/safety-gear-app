@@ -36,11 +36,11 @@ CLASS_NAMES: Dict[int, str] = {
 
 # BGR colours for bounding boxes
 CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
-    CLASS_MOTORCYCLE: (128, 128, 128),    # Grey
-    CLASS_RIDER: (255, 160, 16),          # Blue-ish
-    CLASS_HELMET: (0, 200, 0),            # Green
-    CLASS_FOOTWEAR: (0, 200, 0),          # Green
-    CLASS_IMPROPER_FOOTWEAR: (0, 0, 255), # Red
+    CLASS_MOTORCYCLE: (255, 255, 0),         # Light Blue
+    CLASS_RIDER: (255, 0, 0),                # Blue
+    CLASS_HELMET: (0, 255, 0),               # Green
+    CLASS_FOOTWEAR: (0, 255, 0),             # Green
+    CLASS_IMPROPER_FOOTWEAR: (0, 0, 255),    # Red
 }
 
 # Compliance overlay colours
@@ -49,24 +49,24 @@ COLOR_NON_COMPLIANT_BGR: Tuple[int, int, int] = (0, 0, 255)   # Red
 COLOR_OVERLOAD_BGR: Tuple[int, int, int] = (0, 140, 255)      # Orange
 
 # ── Pipeline queue capacities ──────────────────────────────────────────────────
-FRAME_QUEUE_SIZE = 64
-DETECTION_QUEUE_SIZE = 32
-DISPLAY_QUEUE_SIZE = 16
+FRAME_QUEUE_SIZE = 4
+DETECTION_QUEUE_SIZE = 4
+DISPLAY_QUEUE_SIZE = 2
 
 # ── Detection / tracking defaults ──────────────────────────────────────────────
 @dataclass
 class DetectionConfig:
     """Mutable detection settings shared across threads."""
     conf: float = 0.25
-    iou: float = 0.45
-    imgsz: int = 256
+    iou: float = 0.30
+    imgsz: int = 480
     inference_batch_size: int = 4
-    inference_stride: int = 6
+    inference_stride: int = 2
     use_fp16: bool = False
     device: str = "auto"
     rider_moto_ioa_thresh: float = 0.05
     gear_rider_ioa_thresh: float = 0.10
-    occlusion_conf_thresh: float = 0.15
+    occlusion_conf_thresh: float = 0.10
     max_riders_per_motorcycle: int = 2
     tracker_key: str = "botsort"
 

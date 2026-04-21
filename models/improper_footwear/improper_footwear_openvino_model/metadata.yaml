@@ -1,6 +1,6 @@
 description: Ultralytics YOLO11s-p2 model trained on C:\Users\ditto\Desktop\CODES\safety-gear-compliance\datasets\generated\improper_footwear_detector_final\data.yaml
 author: Ultralytics
-date: '2026-04-20T00:06:26.360698'
+date: '2026-04-22T02:17:27.612025'
 version: 8.4.14
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
@@ -8,8 +8,8 @@ stride: 16
 task: detect
 batch: 1
 imgsz:
-- 320
-- 320
+- 640
+- 640
 names:
   0: improper_footwear
 args:

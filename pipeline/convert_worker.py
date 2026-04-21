@@ -266,11 +266,12 @@ class ConvertWorker(QtCore.QThread):
                     timeout_s = self.OPENVINO_TIMEOUT_SEC
                 else:
                     timeout_s = self.ONNX_TIMEOUT_SEC
-                # Precision policy: always export FP32. Runtime FP16 is
-                # applied only for in-memory PyTorch `.pt` models via
-                # `.half()` during inference. This avoids producing
-                # backend-specific FP16 artifacts during conversion.
-                export_half = False
+                # Precision policy:
+                #   * TensorRT engines benefit massively from FP16 — honour
+                #     the user's ``Use FP16`` checkbox at export time.
+                #   * Other formats stay FP32; FP16 is applied at runtime
+                #     for `.pt` weights via `model.half()`.
+                export_half = bool(half) if fmt == "engine" else False
 
                 try:
                     result_path = self._export_in_subprocess(
@@ -315,12 +316,17 @@ class ConvertWorker(QtCore.QThread):
                 if temp_pt and os.path.isfile(temp_pt):
                     os.remove(temp_pt)
 
-                # TensorRT generates an intermediate ONNX – remove only
-                # if it did not exist before the export
-                if final_fmt == "engine" and not onnx_pre:
+                # TensorRT generates an intermediate ONNX – always remove it
+                # once the .engine is built (we never load .onnx alongside an
+                # .engine; the user explicitly does not want stray .onnx
+                # files in the model directories).
+                if final_fmt == "engine":
                     onnx_path = os.path.join(target_dir, f"{basename}.onnx")
                     if os.path.isfile(onnx_path):
-                        os.remove(onnx_path)
+                        try:
+                            os.remove(onnx_path)
+                        except OSError:
+                            pass
 
                 self.conversion_finished.emit(class_id, True, result_path)
 

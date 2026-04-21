@@ -9,8 +9,8 @@ onnx==1.20.1              # latest 1.x; Ultralytics requires <2.0
 onnxslim==0.1.85          # ONNX graph optimiser used by Ultralytics export
 
 # ── GPU inference (CUDA 12.x) ────────────────────────────────────────────
-onnxruntime-gpu==1.24.2   # ONNX Runtime with CUDA+TensorRT execution providers
-tensorrt-cu12==10.15.1.29 # TensorRT 10.x for CUDA 12
+onnxruntime-gpu>=1.20    # ONNX Runtime with CUDA execution provider
+tensorrt-cu12>=10.0      # TensorRT 10.x for CUDA 12 (engine export + inference)
 
 # ── CPU inference ─────────────────────────────────────────────────────────
 openvino==2025.4.1        # OpenVINO runtime + export

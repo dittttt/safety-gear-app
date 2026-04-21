@@ -11,9 +11,11 @@ objects into the detection queue.
 """
 
 import os
+import sys
 import time
 import queue
 import logging
+import contextlib
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -25,6 +27,43 @@ import torch
 from config import TARGET_CLASS_IDS, CLASS_NAMES
 from pipeline.state import PipelineState, Detection, DetectionPacket
 from utils.runtime_check import detect as detect_runtime
+
+
+# Per-class confidence floor.  Single-class fine-tuned models (especially
+# `improper_footwear`) tend to be under-confident; we let them recall a bit
+# more aggressively than the global slider value.
+_CLASS_CONF_FACTOR: Dict[int, float] = {
+    4: 0.6,   # improper_footwear → run at 60% of the global confidence
+}
+_CLASS_CONF_MIN: Dict[int, float] = {
+    4: 0.10,  # never run improper_footwear below 0.10
+}
+
+
+@contextlib.contextmanager
+def _silence_clevel_stderr():
+    """Redirect the OS-level stderr fd to NUL during TRT / CUDA model load.
+
+    TensorRT (nvinfer.dll) prints [TRT][W] and [TRT][I] messages by writing
+    directly to file descriptor 2, bypassing Python's sys.stderr.  We must
+    dup/redirect at the OS level to silence them.
+    """
+    devnull = "NUL" if sys.platform == "win32" else "/dev/null"
+    try:
+        sys.stderr.flush()
+        _devnull_fd = os.open(devnull, os.O_WRONLY)
+        _old_fd = os.dup(2)
+        os.dup2(_devnull_fd, 2)
+        try:
+            yield
+        finally:
+            sys.stderr.flush()
+            os.dup2(_old_fd, 2)
+            os.close(_old_fd)
+            os.close(_devnull_fd)
+    except OSError:
+        # If the dup trick fails (e.g., restricted env), just run normally.
+        yield
 
 
 class InferenceThread(QtCore.QThread):
@@ -104,7 +143,11 @@ class InferenceThread(QtCore.QThread):
 
     def _create_model(self, path: str) -> YOLO:
         """Instantiate a YOLO model and apply runtime device/precision policy."""
-        model = YOLO(path, task="detect", verbose=False)
+        # TensorRT engines write [TRT][W/I] lines directly to the C-level fd 2.
+        # Suppress those during load; they are benign informational messages.
+        ctx = _silence_clevel_stderr() if path.endswith(".engine") else contextlib.nullcontext()
+        with ctx:
+            model = YOLO(path, task="detect", verbose=False)
         if self._can_move_to_device(path):
             model.to(self._device)
             if self._fp16:
@@ -190,6 +233,13 @@ class InferenceThread(QtCore.QThread):
             f"Inference backend: {self._device}"
             f"{' + FP16' if self._fp16 else ''}"
         )
+
+    @staticmethod
+    def _class_conf(cid: int, base_conf: float) -> float:
+        """Return per-class adjusted confidence threshold."""
+        factor = _CLASS_CONF_FACTOR.get(cid, 1.0)
+        floor = _CLASS_CONF_MIN.get(cid, 0.0)
+        return float(max(floor, min(1.0, base_conf * factor)))
 
     def _predict_kwargs_for(self, cid: int, conf: float, iou: float, imgsz: int) -> dict:
         """Backend-aware kwargs: avoid problematic runtime args on exported engines."""
@@ -352,10 +402,20 @@ class InferenceThread(QtCore.QThread):
 
             if overlay and self._models and infer_idxs:
                 infer_frames = [packets[i].frame for i in infer_idxs]
+
+                # Run every enabled model on every batch of frames.  We used
+                # to short-circuit non-motorcycle classes when no motorcycle
+                # was found in the batch, but that hid valid stand-alone
+                # detections (especially `improper_footwear`).  The IoA
+                # association in the tracker thread already discards gear
+                # that has no rider/motorcycle nearby, so it is cheap and
+                # safer to always run every model.
                 for cid in TARGET_CLASS_IDS:
                     if cid not in self._models or not state.is_model_enabled(cid):
                         continue
-                    kwargs = self._predict_kwargs_for(cid, conf, iou, imgsz)
+
+                    cls_conf = self._class_conf(cid, conf)
+                    kwargs = self._predict_kwargs_for(cid, cls_conf, iou, imgsz)
                     path = self._model_paths.get(cid, "")
                     allow_batch = not self._is_openvino_path(path)
                     results = self._predict_with_fallback(
@@ -364,13 +424,13 @@ class InferenceThread(QtCore.QThread):
                         kwargs,
                         allow_batch=allow_batch,
                     )
+
                     for local_i, result in enumerate(results):
                         if local_i >= len(infer_idxs) or result is None:
                             continue
                         pkt_i = infer_idxs[local_i]
-                        dets_by_idx[pkt_i].extend(
-                            self._extract_detections(result, class_id=cid)
-                        )
+                        extracted_dets = self._extract_detections(result, class_id=cid)
+                        dets_by_idx[pkt_i].extend(extracted_dets)
 
             for i, packet in enumerate(packets):
                 inferred_this_frame = i in infer_set and overlay and bool(self._models)

@@ -217,6 +217,18 @@ class PipelineState:
             dev = str(device or "auto").strip().lower()
             self.detection_config.device = dev if dev in {"auto", "cpu", "cuda"} else "auto"
 
+    def get_max_riders_per_motorcycle(self) -> int:
+        with self._lock:
+            return int(self.detection_config.max_riders_per_motorcycle)
+
+    def set_max_riders_per_motorcycle(self, value: int) -> None:
+        with self._lock:
+            self.detection_config.max_riders_per_motorcycle = max(1, int(value))
+
+    def get_occlusion_conf_thresh(self) -> float:
+        with self._lock:
+            return float(self.detection_config.occlusion_conf_thresh)
+
     def is_model_enabled(self, class_id: int) -> bool:
         with self._lock:
             return self.enabled_models.get(class_id, False)

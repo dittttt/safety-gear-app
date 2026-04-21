@@ -52,3 +52,80 @@
 00:06:22 INFO [1/1] Job start: cid=4  file=improper_footwear.pt  device=cpu  fmt=openvino
 00:06:22 INFO [1/1] Exporting improper_footwear → OPENVINO (imgsz=320)
 00:06:29 INFO Export OK in 7.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\improper_footwear\improper_footwear_openvino_model
+01:17:04 INFO ConvertWorker starting — 2 job(s)
+01:17:04 INFO [1/2] Job start: cid=0  file=motorcycle.pt  device=cuda  fmt=engine
+01:17:04 INFO [1/2] Exporting motorcycle → ENGINE (imgsz=320) — TensorRT build takes 3-8 min, please wait…
+01:18:42 WARNING TensorRT export failed for motorcycle — will use ONNX for this and all remaining GPU models: export subprocess failed (format=engine, code=1)
+stdout-json={"ok": false, "error": "No module named 'tensorrt'", "tb": "Traceback (most recent call last):\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 1017, in export_engine\n    import tensorrt as trt\nModuleNotFoundError: No module named 'tensorrt'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"<string>\", line 8, in <module>\n    out = m.export(format=fmt, half=half, imgsz=imgsz)\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\model.py\", line 710, in export\n    return Exporter(overrides=args, _callbacks=self.callbacks)(model=self.model)\n           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 581, in __call__\n    f[1] = self.export_engine(dla=dla)\n           ~~~~~~~~~~~~~~~~~~^^^^^^^^^\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 252, in outer_func\n    raise e\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 244, in outer_func\n    f = inner_func(*args, **kwargs)  # exported file/dir or tuple of (file/dir, *)\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 1020, in export_engine\n    import tensorrt as trt\nModuleNotFoundError: No module named 'tensorrt'\n"}
+01:18:48 INFO Export OK in 103.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\motorcycle\motorcycle.onnx
+01:18:48 INFO [2/2] Job start: cid=0  file=motorcycle.pt  device=cpu  fmt=openvino
+01:18:48 INFO [2/2] Exporting motorcycle → OPENVINO (imgsz=320)
+01:18:55 INFO Export OK in 6.8s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\motorcycle\motorcycle_openvino_model
+01:22:18 INFO ConvertWorker starting — 10 job(s)
+01:22:18 INFO [1/10] Job start: cid=0  file=motorcycle.pt  device=cuda  fmt=engine
+01:22:18 INFO [1/10] Exporting motorcycle → ENGINE (imgsz=320) — TensorRT build takes 3-8 min, please wait…
+01:22:24 WARNING TensorRT export failed for motorcycle — will use ONNX for this and all remaining GPU models: export subprocess failed (format=engine, code=1)
+stdout-json={"ok": false, "error": "No module named 'tensorrt'", "tb": "Traceback (most recent call last):\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 1017, in export_engine\n    import tensorrt as trt\nModuleNotFoundError: No module named 'tensorrt'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"<string>\", line 8, in <module>\n    out = m.export(format=fmt, half=half, imgsz=imgsz)\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\model.py\", line 710, in export\n    return Exporter(overrides=args, _callbacks=self.callbacks)(model=self.model)\n           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 581, in __call__\n    f[1] = self.export_engine(dla=dla)\n           ~~~~~~~~~~~~~~~~~~^^^^^^^^^\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 252, in outer_func\n    raise e\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 244, in outer_func\n    f = inner_func(*args, **kwargs)  # exported file/dir or tuple of (file/dir, *)\n  File \"C:\\Users\\ditto\\Desktop\\CODES\\safety-gear-app\\.venv\\Lib\\site-packages\\ultralytics\\engine\\exporter.py\", line 1020, in export_engine\n    import tensorrt as trt\nModuleNotFoundError: No module named 'tensorrt'\n"}
+01:22:29 INFO Export OK in 10.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\motorcycle\motorcycle.onnx
+01:22:29 INFO [2/10] Job start: cid=0  file=motorcycle.pt  device=cpu  fmt=openvino
+01:22:29 INFO [2/10] Exporting motorcycle → OPENVINO (imgsz=320)
+01:22:35 INFO Export OK in 6.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\motorcycle\motorcycle_openvino_model
+01:22:35 INFO Skipping TensorRT for rider (failed earlier) — using ONNX
+01:22:35 INFO [3/10] Job start: cid=1  file=rider.pt  device=cuda  fmt=onnx
+01:22:35 INFO [3/10] Exporting rider → ONNX (imgsz=320)
+01:22:41 INFO Export OK in 5.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\rider\rider.onnx
+01:22:41 INFO [4/10] Job start: cid=1  file=rider.pt  device=cpu  fmt=openvino
+01:22:41 INFO [4/10] Exporting rider → OPENVINO (imgsz=320)
+01:22:47 INFO Export OK in 6.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\rider\rider_openvino_model
+01:22:47 INFO Skipping TensorRT for helmet (failed earlier) — using ONNX
+01:22:47 INFO [5/10] Job start: cid=2  file=helmet.pt  device=cuda  fmt=onnx
+01:22:47 INFO [5/10] Exporting helmet → ONNX (imgsz=320)
+01:22:52 INFO Export OK in 5.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\helmet\helmet.onnx
+01:22:52 INFO [6/10] Job start: cid=2  file=helmet.pt  device=cpu  fmt=openvino
+01:22:52 INFO [6/10] Exporting helmet → OPENVINO (imgsz=320)
+01:22:58 INFO Export OK in 6.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\helmet\helmet_openvino_model
+01:22:58 INFO Skipping TensorRT for footwear (failed earlier) — using ONNX
+01:22:58 INFO [7/10] Job start: cid=3  file=footwear.pt  device=cuda  fmt=onnx
+01:22:58 INFO [7/10] Exporting footwear → ONNX (imgsz=320)
+01:23:03 INFO Export OK in 5.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\footwear\footwear.onnx
+01:23:03 INFO [8/10] Job start: cid=3  file=footwear.pt  device=cpu  fmt=openvino
+01:23:03 INFO [8/10] Exporting footwear → OPENVINO (imgsz=320)
+01:23:10 INFO Export OK in 6.2s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\footwear\footwear_openvino_model
+01:23:10 INFO Skipping TensorRT for improper_footwear (failed earlier) — using ONNX
+01:23:10 INFO [9/10] Job start: cid=4  file=improper_footwear.pt  device=cuda  fmt=onnx
+01:23:10 INFO [9/10] Exporting improper_footwear → ONNX (imgsz=320)
+01:23:15 INFO Export OK in 4.9s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\improper_footwear\improper_footwear.onnx
+01:23:15 INFO [10/10] Job start: cid=4  file=improper_footwear.pt  device=cpu  fmt=openvino
+01:23:15 INFO [10/10] Exporting improper_footwear → OPENVINO (imgsz=320)
+01:23:21 INFO Export OK in 6.1s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\improper_footwear\improper_footwear_openvino_model
+01:57:21 INFO ConvertWorker starting — 10 job(s)
+01:57:21 INFO [1/10] Job start: cid=0  file=motorcycle.pt  device=cuda  fmt=engine
+01:57:21 INFO [1/10] Exporting motorcycle → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+02:01:22 INFO Export OK in 241.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\motorcycle\motorcycle.engine
+02:01:22 INFO [2/10] Job start: cid=0  file=motorcycle.pt  device=cpu  fmt=openvino
+02:01:22 INFO [2/10] Exporting motorcycle → OPENVINO (imgsz=640)
+02:01:30 INFO Export OK in 7.5s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\motorcycle\motorcycle_openvino_model
+02:01:30 INFO [3/10] Job start: cid=1  file=rider.pt  device=cuda  fmt=engine
+02:01:30 INFO [3/10] Exporting rider → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+02:05:30 INFO Export OK in 240.5s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\rider\rider.engine
+02:05:30 INFO [4/10] Job start: cid=1  file=rider.pt  device=cpu  fmt=openvino
+02:05:30 INFO [4/10] Exporting rider → OPENVINO (imgsz=640)
+02:05:37 INFO Export OK in 7.1s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\rider\rider_openvino_model
+02:05:37 INFO [5/10] Job start: cid=2  file=helmet.pt  device=cuda  fmt=engine
+02:05:37 INFO [5/10] Exporting helmet → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+02:09:33 INFO Export OK in 235.4s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\helmet\helmet.engine
+02:09:33 INFO [6/10] Job start: cid=2  file=helmet.pt  device=cpu  fmt=openvino
+02:09:33 INFO [6/10] Exporting helmet → OPENVINO (imgsz=640)
+02:09:39 INFO Export OK in 6.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\helmet\helmet_openvino_model
+02:09:39 INFO [7/10] Job start: cid=3  file=footwear.pt  device=cuda  fmt=engine
+02:09:39 INFO [7/10] Exporting footwear → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+02:13:29 INFO Export OK in 229.4s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\footwear\footwear.engine
+02:13:29 INFO [8/10] Job start: cid=3  file=footwear.pt  device=cpu  fmt=openvino
+02:13:29 INFO [8/10] Exporting footwear → OPENVINO (imgsz=640)
+02:13:35 INFO Export OK in 6.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\footwear\footwear_openvino_model
+02:13:35 INFO [9/10] Job start: cid=4  file=improper_footwear.pt  device=cuda  fmt=engine
+02:13:35 INFO [9/10] Exporting improper_footwear → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+02:17:24 INFO Export OK in 228.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\improper_footwear\improper_footwear.engine
+02:17:24 INFO [10/10] Job start: cid=4  file=improper_footwear.pt  device=cpu  fmt=openvino
+02:17:24 INFO [10/10] Exporting improper_footwear → OPENVINO (imgsz=640)
+02:17:31 INFO Export OK in 7.1s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\improper_footwear\improper_footwear_openvino_model

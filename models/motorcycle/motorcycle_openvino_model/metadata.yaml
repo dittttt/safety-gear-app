@@ -1,6 +1,6 @@
 description: Ultralytics YOLO11s model trained on C:\Users\ditto\Desktop\CODES\safety-gear-compliance\datasets\generated\motorcycle_detector_final\data.yaml
 author: Ultralytics
-date: '2026-04-20T00:05:47.510851'
+date: '2026-04-22T02:01:26.327432'
 version: 8.4.14
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
@@ -8,8 +8,8 @@ stride: 32
 task: detect
 batch: 1
 imgsz:
-- 320
-- 320
+- 640
+- 640
 names:
   0: motorcycle
 args:
