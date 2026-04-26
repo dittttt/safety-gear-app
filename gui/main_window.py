@@ -51,6 +51,11 @@ _VIOLATION_LABELS = {
     "improper_footwear": "BAD FOOTWEAR",
     "overload": "OVERLOAD",
 }
+
+# Sentinel key used by the model-picker dictionaries.  The system uses a
+# single unified detector for every class id, so model_combo / browse /
+# convert widgets are stored once under this key instead of once per class.
+_UNIFIED_KEY = -1
 _STAT_ITEMS = (
     ("motorcycles", "Motorcycles"),
     ("riders", "Riders"),
@@ -204,10 +209,11 @@ def _qss(s: float, chk: str) -> str:
         f"#sidebar{{background:{_BG_SB};border-right:1px solid {_BD};}}"
         f"#sidebar QLabel{{color:{_T};}}"
         f"#sidebarTitle{{font-size:{px(13)};font-weight:600;color:{_TH};"
-        f"padding:{px(6)} 0 {px(10)} 0;letter-spacing:0.5px;}}"
+        f"padding:{px(6)} 0 {px(10)} 0;margin:0;letter-spacing:0.5px;}}"
         f"#sectionLabel{{font-size:{px(10)};font-weight:600;color:{_TD};"
-        f"text-transform:uppercase;letter-spacing:1.2px;"
-        f"padding:{px(14)} 0 {px(4)} 0;}}"
+        f"text-transform:uppercase;"
+        f"padding:{px(14)} 0 {px(4)} 0;margin:0;"
+        f"qproperty-indent:0;}}"
         f"#modelCard{{background:transparent;border:none;"
         f"border-radius:0;padding:{px(2)} 0;margin:0;}}"
         f"#modelFileIcon{{background:transparent;border:none;min-width:0;"
@@ -278,7 +284,8 @@ def _qss(s: float, chk: str) -> str:
         f"padding:0;margin:0;background:transparent;}}"
         f"#vidName{{color:{_T};font-size:{px(11)};padding:0;"
         f"background:transparent;}}"
-        f"#sliderLabel{{color:{_TD};font-size:{px(11)};}}"
+        f"#sliderLabel{{color:{_TD};font-size:{px(11)};margin:0;"
+        f"padding:0;qproperty-indent:0;}}"
         # comboboxes – styled to match the playback-speed QMenu popup
         f"QComboBox{{background:#161616;color:{_T};"
         f"border:1px solid {_BD};border-radius:{_r};"
@@ -505,8 +512,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splitter.setStretchFactor(2, 0)
         self._splitter.setCollapsible(0, False)
         self._splitter.setCollapsible(2, False)
+        # Console panel default width is 75% of the legacy 360px value.
+        self._console_default_w = int(270 * _S)
+        self._console_last_w = 0  # populated when user resizes / closes
         self._splitter.setSizes(
-            [int(260 * _S), int(805 * _S), int(360 * _S)])
+            [int(260 * _S), int(805 * _S), self._console_default_w])
+
+        def _on_splitter_moved(*_a):
+            sizes = self._splitter.sizes()
+            if len(sizes) >= 3 and self._consolePanel.isVisible() and sizes[2] > 0:
+                self._console_last_w = sizes[2]
+        self._splitter.splitterMoved.connect(_on_splitter_moved)
 
         # top bar
         self._topBar = tb = QtWidgets.QWidget()
@@ -704,18 +720,26 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(content)
         lay.setContentsMargins(
             int(14*_S), int(14*_S), int(14*_S), int(14*_S))
-        lay.setSpacing(int(4 * _S))
+        lay.setSpacing(int(8 * _S))
 
         hdr = QtWidgets.QLabel("Controls")
-        hdr.setObjectName("sidebarTitle"); lay.addWidget(hdr)
+        hdr.setObjectName("sidebarTitle")
+        lay.addWidget(hdr)
 
         # VIDEO / DEVICE
         vid_sec_lay = QtWidgets.QHBoxLayout()
-        vid_sec_lay.setContentsMargins(0, 0, 0, 0)
-        vid_sec_lay.setSpacing(0)
+        vid_sec_lay.setContentsMargins(0, int(14*_S), 0, int(4*_S))
+        vid_sec_lay.setSpacing(int(4 * _S))
         vid_sec_lbl = self._section("VIDEO / DEVICE")
-        vid_sec_lay.addWidget(vid_sec_lbl)
-        vid_sec_lay.addStretch()
+        vid_sec_lbl.setContentsMargins(0, 0, 0, 0)
+        # Override the CSS padding so the layout margin drives the spacing,
+        # letting the button align vertically with the label text.
+        vid_sec_lbl.setStyleSheet(
+            f"color:{_TD};font-size:{int(10*_S)}px;font-weight:600;"
+            "text-transform:uppercase;padding:0;margin:0;"
+            "qproperty-indent:0;"
+        )
+        vid_sec_lay.addWidget(vid_sec_lbl, 1, QtCore.Qt.AlignVCenter)
 
         cam_icon_sz = int(11 * _S)
         self.btnRefreshCams = QtWidgets.QPushButton()
@@ -726,7 +750,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnRefreshCams.setToolTip("Refresh camera list")
         self.btnRefreshCams.setIcon(_fa("sync-alt", _TD, cam_icon_sz))
         self.btnRefreshCams.setFixedSize(int(22 * _S), int(22 * _S))
-        vid_sec_lay.addWidget(self.btnRefreshCams)
+        vid_sec_lay.addWidget(self.btnRefreshCams, 0, QtCore.Qt.AlignVCenter)
         
         lay.addLayout(vid_sec_lay)
 
@@ -806,39 +830,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnToggleAllModels = QtWidgets.QPushButton("Enable / Disable All")
         self.btnToggleAllModels.setFixedHeight(int(26 * _S))
         self.btnToggleAllModels.setFocusPolicy(QtCore.Qt.NoFocus)
-        self.btnAutoModels = QtWidgets.QPushButton("Auto")
-        self.btnAutoModels.setFixedHeight(int(26 * _S))
-        self.btnAutoModels.setFocusPolicy(QtCore.Qt.NoFocus)
-        self.btnAutoModels.setToolTip("Selects auto (best for device) for all models")
-        tog_row = QtWidgets.QHBoxLayout()
-        tog_row.setContentsMargins(0, 0, 0, 0)
-        tog_row.setSpacing(int(6 * _S))
-        tog_row.addWidget(self.btnToggleAllModels)
-        tog_row.addWidget(self.btnAutoModels)
-        lay.addLayout(tog_row)
-
-        fmt_row = QtWidgets.QHBoxLayout()
-        fmt_row.setContentsMargins(0, 0, 0, 0)
-        fmt_row.setSpacing(int(6 * _S))
-        self.btnSetAllPyTorch = QtWidgets.QPushButton("PyTorch")
-        self.btnSetAllTensorRT = QtWidgets.QPushButton("TensorRT")
-        self.btnSetAllOpenVINO = QtWidgets.QPushButton("OpenVINO")
-        for btn in (self.btnSetAllPyTorch, self.btnSetAllTensorRT,
-                    self.btnSetAllOpenVINO):
-            btn.setFixedHeight(int(24 * _S))
-            btn.setFocusPolicy(QtCore.Qt.NoFocus)
-            btn.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Fixed)
-            fmt_row.addWidget(btn)
-        lay.addLayout(fmt_row)
+        self.btnToggleAllModels.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        lay.addWidget(self.btnToggleAllModels)
         lay.addSpacing(int(4 * _S))
 
         self._mtog: Dict[int, QtWidgets.QCheckBox] = {}
+        self._mcolor_dot: Dict[int, QtWidgets.QPushButton] = {}
+
+        # Single unified picker — every class id gets the same model file.
+        # The dicts below are kept for legacy code paths but only ever hold
+        # the sentinel ``_UNIFIED_KEY`` entry.
         self._mcombo: Dict[int, _AlignedComboBox] = {}
         self._mconv: Dict[int, QtWidgets.QPushButton] = {}
         self._mbrowse: Dict[int, QtWidgets.QPushButton] = {}
-        self._mcolor_dot: Dict[int, QtWidgets.QPushButton] = {}
         self._mfmt_label: Dict[int, QtWidgets.QLabel] = {}  # no-op compat
 
         _bisz = int(11 * _S)  # small icon size
@@ -847,17 +852,74 @@ class MainWindow(QtWidgets.QMainWindow):
         mcard = QtWidgets.QWidget(); mcard.setObjectName("modelCard")
         ml = QtWidgets.QVBoxLayout(mcard)
         ml.setContentsMargins(0, int(4*_S), 0, int(4*_S))
-        ml.setSpacing(int(8 * _S))
+        ml.setSpacing(int(6 * _S))
+
+        # ── Unified model picker (one per app, regardless of class) ──────
+        u_lbl = QtWidgets.QLabel("Unified Detector")
+        u_lbl.setObjectName("sliderLabel")
+        ml.addWidget(u_lbl)
+
+        u_row = QtWidgets.QHBoxLayout()
+        u_row.setContentsMargins(0, 0, 0, 0)
+        u_row.setSpacing(int(6 * _S))
+
+        u_combo = _AlignedComboBox()
+        u_combo.setObjectName("modelCombo")
+        u_combo.setMinimumHeight(int(24 * _S))
+        u_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed)
+        u_combo.view().setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        u_combo.view().setTextElideMode(QtCore.Qt.ElideRight)
+        u_combo.view().setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        u_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        u_combo.setMinimumContentsLength(0)
+        self._mcombo[_UNIFIED_KEY] = u_combo
+        u_row.addWidget(u_combo, stretch=1)
+
+        u_browse = QtWidgets.QPushButton()
+        u_browse.setObjectName("iconBtn")
+        u_browse.setIcon(_fa("folder-open", _TD, _bisz))
+        u_browse.setIconSize(QtCore.QSize(_bisz, _bisz))
+        u_browse.setFixedSize(_bsq, _bsq)
+        u_browse.setToolTip("Browse for unified detector model")
+        u_browse.setFlat(True)
+        u_browse.setFocusPolicy(QtCore.Qt.NoFocus)
+        u_browse.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self._mbrowse[_UNIFIED_KEY] = u_browse
+        u_row.addWidget(u_browse, 0, QtCore.Qt.AlignVCenter)
+
+        u_conv = QtWidgets.QPushButton()
+        u_conv.setObjectName("iconBtn")
+        u_conv.setIcon(_fa("bolt", _TD, _bisz))
+        u_conv.setIconSize(QtCore.QSize(_bisz, _bisz))
+        u_conv.setFixedSize(_bsq, _bsq)
+        u_conv.setToolTip("Optimise unified detector")
+        u_conv.setFlat(True)
+        u_conv.setFocusPolicy(QtCore.Qt.NoFocus)
+        u_conv.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        u_conv.setVisible(False)
+        self._mconv[_UNIFIED_KEY] = u_conv
+        u_row.addWidget(u_conv, 0, QtCore.Qt.AlignVCenter)
+
+        ml.addLayout(u_row)
+        ml.addSpacing(int(4 * _S))
+
+        # ── Per-class detection toggles ─────────────────────────────────
+        # The single unified detector emits every class; these checkboxes
+        # filter which classes the pipeline acts on (visibility + stats).
+        cls_lbl = QtWidgets.QLabel("Classes")
+        cls_lbl.setObjectName("sliderLabel")
+        ml.addWidget(cls_lbl)
 
         for cid in TARGET_CLASS_IDS:
             name = CLASS_NAMES[cid]
 
-            # ── row 1: color dot  +  checkbox  +  browse  +  bolt
-            r1 = QtWidgets.QHBoxLayout()
-            r1.setContentsMargins(0, 0, 0, 0)
-            r1.setSpacing(int(6 * _S))
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(int(6 * _S))
 
-            # clickable colour dot
             dot = QtWidgets.QPushButton()
             dot.setObjectName("colorDot")
             _dsz = int(10 * _S)
@@ -873,69 +935,24 @@ class MainWindow(QtWidgets.QMainWindow):
             dot.setFlat(True)
             dot.setFocusPolicy(QtCore.Qt.NoFocus)
             self._mcolor_dot[cid] = dot
-            r1.addWidget(dot, 0, QtCore.Qt.AlignVCenter)
+            row.addWidget(dot, 0, QtCore.Qt.AlignVCenter)
 
             chk = QtWidgets.QCheckBox(name)
             chk.setChecked(True)
             self._mtog[cid] = chk
-            r1.addWidget(chk)
-            r1.addStretch()
+            row.addWidget(chk)
+            row.addStretch()
 
-            # browse (folder) button
-            bbrowse = QtWidgets.QPushButton()
-            bbrowse.setObjectName("iconBtn")
-            bbrowse.setIcon(_fa("folder-open", _TD, _bisz))
-            bbrowse.setIconSize(QtCore.QSize(_bisz, _bisz))
-            bbrowse.setFixedSize(_bsq, _bsq)
-            bbrowse.setToolTip(f"Browse for {name} model")
-            bbrowse.setFlat(True)
-            bbrowse.setFocusPolicy(QtCore.Qt.NoFocus)
-            bbrowse.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            self._mbrowse[cid] = bbrowse
-            r1.addWidget(bbrowse, 0, QtCore.Qt.AlignVCenter)
-
-            # convert (bolt) button
-            conv = QtWidgets.QPushButton()
-            conv.setObjectName("iconBtn")
-            conv.setIcon(_fa("bolt", _TD, _bisz))
-            conv.setIconSize(QtCore.QSize(_bisz, _bisz))
-            conv.setFixedSize(_bsq, _bsq)
-            conv.setToolTip(f"Optimise {name} model")
-            conv.setFlat(True)
-            conv.setFocusPolicy(QtCore.Qt.NoFocus)
-            conv.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            conv.setVisible(False)
-            self._mconv[cid] = conv
-            r1.addWidget(conv, 0, QtCore.Qt.AlignVCenter)
-
-            ml.addLayout(r1)
-
-            # ── row 2: model selector combo
-            combo = _AlignedComboBox()
-            combo.setObjectName("modelCombo")
-            combo.setMinimumHeight(int(24 * _S))
-            combo.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding,
-                QtWidgets.QSizePolicy.Fixed)
-            combo.view().setHorizontalScrollBarPolicy(
-                QtCore.Qt.ScrollBarAlwaysOff)
-            combo.view().setTextElideMode(QtCore.Qt.ElideRight)
-            combo.view().setSelectionMode(
-                QtWidgets.QAbstractItemView.SingleSelection)
-            combo.setSizeAdjustPolicy(
-                QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            combo.setMinimumContentsLength(0)
-            self._mcombo[cid] = combo
-            ml.addWidget(combo)
+            ml.addLayout(row)
 
         lay.addWidget(mcard)
 
-        # Optimize All button
+        # Optimize All button (legacy alias for the unified converter)
         self.btnOptimizeAll = QtWidgets.QPushButton()
         _oisz = int(13 * _S)
         self.btnOptimizeAll.setIcon(_fa("bolt", _T, _oisz))
         self.btnOptimizeAll.setIconSize(QtCore.QSize(_oisz, _oisz))
-        self.btnOptimizeAll.setText("  Optimize All Models")
+        self.btnOptimizeAll.setText("  Optimize Unified Detector")
         self.btnOptimizeAll.setFixedHeight(int(28 * _S))
         self.btnOptimizeAll.setFocusPolicy(QtCore.Qt.NoFocus)
         self.btnOptimizeAll.setSizePolicy(
@@ -1008,6 +1025,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chkOverload.setFocusPolicy(QtCore.Qt.NoFocus)
         dl.addWidget(self.chkOverload)
 
+        self.chkDbLogging = QtWidgets.QCheckBox("DB Logging (Supabase)")
+        self.chkDbLogging.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.chkDbLogging.setChecked(True)
+        self.chkDbLogging.setFocusPolicy(QtCore.Qt.NoFocus)
+        dl.addWidget(self.chkDbLogging)
+
         stride_lbl = QtWidgets.QLabel("Inference Stride")
         stride_lbl.setObjectName("sliderLabel")
         dl.addWidget(stride_lbl)
@@ -1037,63 +1060,98 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_railbar(self) -> QtWidgets.QWidget:
         """Narrow rail shown when the sidebar is collapsed.
 
-        Lists each model class as [color dot] [checkbox] so the user can
-        still toggle detection on/off without expanding the full sidebar.
+        Top-aligned, horizontally centred. Contains:
+          * Hamburger to expand back to the full sidebar.
+          * One coloured pill per class (click toggles detection).
         """
         rb = QtWidgets.QWidget()
         rb.setObjectName("sidebar")
         rail_w = int(54 * _S)
         rb.setFixedWidth(rail_w)
         v = QtWidgets.QVBoxLayout(rb)
-        v.setContentsMargins(int(6 * _S), int(8 * _S),
-                             int(6 * _S), int(8 * _S))
-        v.setSpacing(int(6 * _S))
-        # Vertically centre the rail rows.
-        v.addStretch(1)
+        v.setContentsMargins(int(6 * _S), int(10 * _S),
+                             int(6 * _S), int(10 * _S))
+        v.setSpacing(int(8 * _S))
+        v.setAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+
+        # Expand-back button at the top of the rail.
+        self.btnRailExpand = self._ibtn("bars", "Expand sidebar")
+        v.addWidget(self.btnRailExpand, 0, QtCore.Qt.AlignHCenter)
+
+        # Subtle divider
+        sep1 = QtWidgets.QFrame()
+        sep1.setFrameShape(QtWidgets.QFrame.HLine)
+        sep1.setStyleSheet(f"color:{_BD};background:{_BD};max-height:1px;")
+        v.addWidget(sep1)
 
         self._rail_chk: Dict[int, QtWidgets.QCheckBox] = {}
         self._rail_dot: Dict[int, QtWidgets.QPushButton] = {}
 
-        _dsz = int(10 * _S)
+        # Per-class "pill" buttons. Coloured circle that doubles as the
+        # detection toggle; greyed-out when the class is disabled.
+        _pill = int(30 * _S)
         for cid in TARGET_CLASS_IDS:
-            row = QtWidgets.QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(int(6 * _S))
-
-            dot = QtWidgets.QPushButton()
-            dot.setObjectName("colorDot")
-            dot.setFixedSize(_dsz, _dsz)
+            name = CLASS_NAMES.get(cid, "?")
             clr = self._to_qcolor_bgr(self._state.get_class_color(cid))
-            dot.setStyleSheet(
-                f"background:{clr.name()};border:none;"
-                f"border-radius:{_dsz // 2}px;"
-                f"min-width:{_dsz}px;max-width:{_dsz}px;"
-                f"min-height:{_dsz}px;max-height:{_dsz}px;")
-            dot.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            dot.setToolTip(f"{CLASS_NAMES.get(cid, '?')} – change colour")
-            dot.setFlat(True)
-            dot.setFocusPolicy(QtCore.Qt.NoFocus)
-            dot.clicked.connect(lambda _=False, c=cid: self._on_pick_model_color(c))
-            self._rail_dot[cid] = dot
 
             chk = QtWidgets.QCheckBox()
             chk.setChecked(True)
-            chk.setToolTip(CLASS_NAMES.get(cid, "?"))
-            chk.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            chk.setFocusPolicy(QtCore.Qt.NoFocus)
+            chk.setVisible(False)        # state holder only
             chk.toggled.connect(lambda v, c=cid: self._on_rail_chk_toggled(c, v))
             self._rail_chk[cid] = chk
 
-            row.addWidget(dot, 0, QtCore.Qt.AlignVCenter)
-            row.addWidget(chk, 0, QtCore.Qt.AlignVCenter)
-            row.addStretch(1)
+            dot = QtWidgets.QPushButton(name[:1].upper())
+            dot.setObjectName("railPill")
+            dot.setFixedSize(_pill, _pill)
+            dot.setMinimumSize(_pill, _pill)
+            dot.setMaximumSize(_pill, _pill)
+            dot.setCheckable(True)
+            dot.setChecked(True)
+            dot.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            dot.setFocusPolicy(QtCore.Qt.NoFocus)
+            dot.setFlat(True)
+            dot.setToolTip(f"{name} — click to toggle, right-click for colour")
+            dot.setStyleSheet(self._rail_pill_qss(clr, _pill))
 
-            wrap = QtWidgets.QWidget()
-            wrap.setLayout(row)
-            v.addWidget(wrap, 0, QtCore.Qt.AlignHCenter)
+            def _on_pill_toggled(v, c=cid):
+                rail_chk = self._rail_chk.get(c)
+                if rail_chk is not None and rail_chk.isChecked() != v:
+                    rail_chk.setChecked(v)
+
+            dot.toggled.connect(_on_pill_toggled)
+            # Right-click → pick colour, mirroring expanded sidebar.
+            dot.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            dot.customContextMenuRequested.connect(
+                lambda _pos, c=cid: self._on_pick_model_color(c))
+
+            self._rail_dot[cid] = dot
+            v.addWidget(dot, 0, QtCore.Qt.AlignHCenter)
 
         v.addStretch(1)
         return rb
+
+    def _rail_pill_qss(self, clr: QtGui.QColor, size: int) -> str:
+        """Build the QSS for a perfect-circle rail pill at *size* px."""
+        r = size // 2
+        font_px = int(13 * _S)
+        return (
+            "QPushButton#railPill{"
+            f"background:{clr.name()};color:#0b0d12;"
+            "border:none;padding:0;margin:0;"
+            f"min-width:{size}px;max-width:{size}px;"
+            f"min-height:{size}px;max-height:{size}px;"
+            f"border-radius:{r}px;"
+            f"font-weight:700;font-size:{font_px}px;"
+            "text-align:center;"
+            "}"
+            "QPushButton#railPill:!checked{"
+            f"background:{_BG};color:{_TD};"
+            f"border:1px solid {_BD};"
+            "}"
+            "QPushButton#railPill:hover{"
+            f"border:1px solid {_TH};"
+            "}"
+        )
 
     def _on_rail_chk_toggled(self, cid: int, value: bool) -> None:
         """Mirror rail checkbox state into the full sidebar checkbox."""
@@ -1189,14 +1247,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _toggle_console(self) -> None:
         if self._consolePanel.isVisible():
-            self._consolePanel.hide()
+            # Remember the width so we can restore it next time
             sizes = self._splitter.sizes()
+            if len(sizes) >= 3 and sizes[2] > 0:
+                self._console_last_w = sizes[2]
+            self._consolePanel.hide()
             if len(sizes) >= 2:
                 self._splitter.setSizes(
                     [sizes[0], sizes[1] + sum(sizes[2:]), 0])
         else:
             self._consolePanel.show()
-            target = int(360 * _S)
+            target = int(getattr(self, "_console_last_w", 0)
+                         or self._console_default_w)
             sizes = self._splitter.sizes()
             if len(sizes) >= 2 and sizes[1] > target + int(200 * _S):
                 self._splitter.setSizes(
@@ -1309,10 +1371,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return None
 
     def _sync_rail_from_sidebar(self) -> None:
-        """Push sidebar checkbox / colour dot state onto the rail."""
+        """Push sidebar checkbox / colour state onto the rail pills."""
         if not getattr(self, "_rail_chk", None):
             return
-        _dsz = int(10 * _S)
+        _pill = int(30 * _S)
         for cid in TARGET_CLASS_IDS:
             src = self._mtog.get(cid)
             dst = self._rail_chk.get(cid)
@@ -1323,11 +1385,12 @@ class MainWindow(QtWidgets.QMainWindow):
             dot = self._rail_dot.get(cid)
             if dot is not None:
                 clr = self._to_qcolor_bgr(self._state.get_class_color(cid))
-                dot.setStyleSheet(
-                    f"background:{clr.name()};border:none;"
-                    f"border-radius:{_dsz // 2}px;"
-                    f"min-width:{_dsz}px;max-width:{_dsz}px;"
-                    f"min-height:{_dsz}px;max-height:{_dsz}px;")
+                checked = src.isChecked() if src is not None else True
+                if dot.isChecked() != checked:
+                    dot.blockSignals(True)
+                    dot.setChecked(checked)
+                    dot.blockSignals(False)
+                dot.setStyleSheet(self._rail_pill_qss(clr, _pill))
 
     def _toggle_sidebar_collapsed(self) -> None:
         self._sidebar_collapsed = not getattr(self, "_sidebar_collapsed", False)
@@ -1348,29 +1411,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._repos)
 
     def _update_model_format_labels(self) -> None:
-        """Update sidebar format labels from current combo selections."""
-        for cid in TARGET_CLASS_IDS:
-            lbl = self._mfmt_label.get(cid)
-            if not lbl:
-                continue
-            combo = self._mcombo.get(cid)
-            if not combo:
-                lbl.setText("\u2014")
-                continue
-            data = combo.currentData()
-            if not data:
-                lbl.setText("\u2014")
-            elif data.get("type") == "auto":
-                path = self._state.model_paths.get(cid)
-                if path:
-                    fmt = _detect_format(path)
-                    lbl.setText(
-                        _FORMAT_LABEL.get(fmt, "Auto") if fmt else "Auto")
-                else:
-                    lbl.setText("\u2014")
-            else:
-                fmt = data.get("format", "")
-                lbl.setText(_FORMAT_LABEL.get(fmt, fmt.upper()))
+        """No-op kept for legacy callers; sidebar no longer shows per-class\n        format labels under the unified-detector layout."""
+        return
 
     # ── overlay positioning ───────────────────────────────────────────────
 
@@ -1702,13 +1744,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.seekSlider.sliderMoved.connect(self._on_seek_moved)
         self.spdSlider.valueChanged.connect(self._on_speed_changed)
         self.btnToggleAllModels.clicked.connect(self._on_toggle_all_models)
-        self.btnAutoModels.clicked.connect(self._on_auto_models)
-        self.btnSetAllPyTorch.clicked.connect(
-            lambda: self._set_all_models_format("pt", "PyTorch"))
-        self.btnSetAllTensorRT.clicked.connect(
-            lambda: self._set_all_models_format("engine", "TensorRT"))
-        self.btnSetAllOpenVINO.clicked.connect(
-            lambda: self._set_all_models_format("openvino", "OpenVINO"))
         for cid, chk in self._mtog.items():
             chk.toggled.connect(
                 lambda v, c=cid: self._on_sidebar_chk_toggled(c, v))
@@ -1718,8 +1753,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.deviceCombo.currentIndexChanged.connect(self._on_device_changed)
         self.chkFp16.toggled.connect(self._on_fp16_toggled)
         self.chkOverload.toggled.connect(self._on_overload_toggled)
+        self.chkDbLogging.toggled.connect(self._on_db_logging_toggled)
         self.strideSlider.valueChanged.connect(self._on_stride_changed)
         self.btnHamburger.clicked.connect(self._toggle_sidebar_collapsed)
+        self.btnRailExpand.clicked.connect(self._toggle_sidebar_collapsed)
         self.btnHudLock.clicked.connect(self._toggle_hud_lock)
         self.btnLogs.clicked.connect(self._toggle_console)
         self.btnClearConsole.clicked.connect(self._on_clear_console)
@@ -1775,39 +1812,29 @@ class MainWindow(QtWidgets.QMainWindow):
             else "All model classes disabled")
 
     def _on_auto_models(self) -> None:
-        for cid in TARGET_CLASS_IDS:
-            combo = self._mcombo.get(cid)
-            if combo is not None and combo.count() > 0:
-                combo.setCurrentIndex(0)
-        self._set_status("All models set to Auto")
+        combo = self._mcombo.get(_UNIFIED_KEY)
+        if combo is not None and combo.count() > 0:
+            combo.setCurrentIndex(0)
+        self._set_status("Unified detector set to Auto")
 
     def _set_all_models_format(self, fmt: str, label: str) -> None:
-        """Set every model combobox to the requested runtime format."""
-        missing = []
-        changed = 0
-        for cid in TARGET_CLASS_IDS:
-            combo = self._mcombo.get(cid)
-            if combo is None:
-                continue
-            target_idx = -1
-            for idx in range(combo.count()):
-                data = combo.itemData(idx) or {}
-                if data.get("type") in ("variant", "custom") and data.get("format") == fmt:
-                    target_idx = idx
-                    break
-            if target_idx >= 0:
-                if combo.currentIndex() != target_idx:
-                    combo.setCurrentIndex(target_idx)
-                    changed += 1
-            else:
-                missing.append(CLASS_NAMES.get(cid, str(cid)))
-
-        if missing:
-            self._set_status(
-                f"Set {label} where available ({changed} changed). "
-                f"Missing: {', '.join(missing)}")
+        """Set the unified detector combobox to the requested runtime format."""
+        combo = self._mcombo.get(_UNIFIED_KEY)
+        if combo is None:
+            self._set_status("No unified detector picker available")
+            return
+        target_idx = -1
+        for idx in range(combo.count()):
+            data = combo.itemData(idx) or {}
+            if data.get("type") in ("variant", "custom") and data.get("format") == fmt:
+                target_idx = idx
+                break
+        if target_idx >= 0:
+            if combo.currentIndex() != target_idx:
+                combo.setCurrentIndex(target_idx)
+            self._set_status(f"Unified detector set to {label}")
         else:
-            self._set_status(f"Set all models to {label}")
+            self._set_status(f"{label} format not available for unified detector")
 
     def _step_forward(self) -> None:
         path, _cam = self._state.get_source()
@@ -1824,12 +1851,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._model_groups = discover_models()
-        loaded = []
-        for cid in TARGET_CLASS_IDS:
-            self._populate_model_combo(cid)
-            group = self._model_groups.get(cid)
-            if group and group.variants:
-                loaded.append(CLASS_NAMES[cid])
+        # Single unified picker — populate it once and report whether the
+        # detector was found.
+        self._populate_model_combo(_UNIFIED_KEY)
+        probe_cid = next(iter(TARGET_CLASS_IDS))
+        probe = self._model_groups.get(probe_cid)
+        loaded = ["Unified Detector"] if (probe and probe.variants) else []
         use_cuda = self._has_cuda()
         default_imgsz = 640 if use_cuda else 480
         default_stride = 1 if use_cuda else 2
@@ -1884,15 +1911,27 @@ class MainWindow(QtWidgets.QMainWindow):
             return "cuda"
         return "cpu"
 
-    def _populate_model_combo(self, cid: int) -> None:
-        """Fill a model combobox with Auto + discovered variants only."""
-        combo = self._mcombo[cid]
+    def _mirror_unified_path(self, path: Optional[str]) -> None:
+        """Set ``state.model_paths[cid] = path`` for every target class id.
+
+        With a single unified detector, every class id resolves to the
+        same physical model file.
+        """
+        for tcid in TARGET_CLASS_IDS:
+            self._state.model_paths[tcid] = path
+
+    def _populate_model_combo(self, cid: int = _UNIFIED_KEY) -> None:
+        """Fill the unified model combobox with Auto + discovered variants."""
+        combo = self._mcombo[_UNIFIED_KEY]
         combo.blockSignals(True)
         combo.clear()
 
         combo.addItem("Auto (best for device)", {"type": "auto"})
 
-        group = self._model_groups.get(cid)
+        # All groups share the same variant list under the unified scheme;
+        # any cid works as a probe.
+        probe_cid = next(iter(TARGET_CLASS_IDS))
+        group = self._model_groups.get(probe_cid)
         if group and group.variants:
             for v in group.variants:
                 combo.addItem(v.display_name, {
@@ -1902,29 +1941,30 @@ class MainWindow(QtWidgets.QMainWindow):
         combo.setCurrentIndex(0)
         combo.blockSignals(False)
 
-        self._prev_combo_idx[cid] = 0
-        self._resolve_auto_model(cid)
+        self._prev_combo_idx[_UNIFIED_KEY] = 0
+        self._resolve_auto_model(_UNIFIED_KEY)
 
-    def _resolve_auto_model(self, cid: int) -> None:
+    def _resolve_auto_model(self, cid: int = _UNIFIED_KEY) -> None:
         """Resolve the 'Auto' selection to the best variant for the device."""
-        group = self._model_groups.get(cid)
-        combo = self._mcombo[cid]
+        probe_cid = next(iter(TARGET_CLASS_IDS))
+        group = self._model_groups.get(probe_cid)
+        combo = self._mcombo[_UNIFIED_KEY]
         if not group or not group.variants:
-            self._state.model_paths[cid] = None
+            self._mirror_unified_path(None)
             combo.setToolTip("No models found")
             return
         device = self._get_effective_device()
         variant = group.best_for_device(device)
         if variant:
-            self._state.model_paths[cid] = variant.path
+            self._mirror_unified_path(variant.path)
             combo.setToolTip(f"Using: {variant.display_name}")
         else:
-            self._state.model_paths[cid] = None
+            self._mirror_unified_path(None)
             combo.setToolTip("No compatible model for current device")
 
-    def _on_model_combo_changed(self, cid: int) -> None:
-        """Handle model combobox selection change."""
-        combo = self._mcombo[cid]
+    def _on_model_combo_changed(self, cid: int = _UNIFIED_KEY) -> None:
+        """Handle unified model combobox selection change."""
+        combo = self._mcombo[_UNIFIED_KEY]
         data = combo.currentData()
         if not data:
             return
@@ -1932,26 +1972,21 @@ class MainWindow(QtWidgets.QMainWindow):
         kind = data.get("type")
 
         if kind == "auto":
-            self._resolve_auto_model(cid)
-            self._prev_combo_idx[cid] = combo.currentIndex()
-            self._update_convert_buttons()
-            self._update_model_format_labels()
-
+            self._resolve_auto_model(_UNIFIED_KEY)
         elif kind in ("variant", "custom"):
-            self._state.model_paths[cid] = data["path"]
+            self._mirror_unified_path(data["path"])
             combo.setToolTip(data["path"])
-            self._prev_combo_idx[cid] = combo.currentIndex()
-            self._update_convert_buttons()
-            self._update_model_format_labels()
 
-    def _on_browse_model(self, cid: int) -> None:
-        """Open a file/folder dialog for browsing a model."""
+        self._prev_combo_idx[_UNIFIED_KEY] = combo.currentIndex()
+        self._update_convert_buttons()
+        self._update_model_format_labels()
+
+    def _on_browse_model(self, cid: int = _UNIFIED_KEY) -> None:
+        """Open a file/folder dialog for browsing the unified model."""
         from utils.model_registry import MODELS_DIR
         start_dir = MODELS_DIR if os.path.isdir(MODELS_DIR) else ""
-        name = CLASS_NAMES.get(cid, "")
-        # Try file first
         p, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, f"Load {name} Model", start_dir,
+            self, "Load Unified Detector", start_dir,
             "Model Files (*.pt *.engine *.onnx);;OpenVINO (*.xml);;All (*)")
         if p:
             # If user picked an .xml inside an openvino dir, use the parent dir
@@ -1959,11 +1994,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 parent = os.path.dirname(p)
                 if _detect_format(parent) == "openvino":
                     p = parent
-            self._add_custom_model(cid, p)
+            self._add_custom_model(_UNIFIED_KEY, p)
             return
 
     def _add_custom_model(self, cid: int, path: str) -> None:
-        """Add a user-browsed model to the combobox and select it."""
+        """Add a user-browsed model to the unified combobox and select it."""
         fmt = _detect_format(path)
         if not fmt:
             QtWidgets.QMessageBox.warning(
@@ -1971,43 +2006,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Cannot detect model format:\n{path}")
             return
         label = f"{os.path.basename(path)}  ({_FORMAT_LABEL.get(fmt, fmt)})"
-        combo = self._mcombo[cid]
+        combo = self._mcombo[_UNIFIED_KEY]
         combo.blockSignals(True)
-        # Append at end
         insert_idx = combo.count()
         combo.insertItem(insert_idx, label, {
             "type": "custom", "path": path, "format": fmt,
         })
         combo.setCurrentIndex(insert_idx)
         combo.blockSignals(False)
-        self._state.model_paths[cid] = path
+        self._mirror_unified_path(path)
         combo.setToolTip(path)
-        self._prev_combo_idx[cid] = insert_idx
+        self._prev_combo_idx[_UNIFIED_KEY] = insert_idx
         self._update_convert_buttons()
         self._update_model_format_labels()
 
     def _refresh_model_combos(self) -> None:
-        """Re-discover models and repopulate all comboboxes."""
+        """Re-discover models and repopulate the unified combobox."""
         self._model_groups = discover_models()
-        for cid in TARGET_CLASS_IDS:
-            combo = self._mcombo[cid]
-            old_data = combo.currentData() or {}
-            was_auto = old_data.get("type") == "auto"
-            old_path = old_data.get("path")
+        combo = self._mcombo[_UNIFIED_KEY]
+        old_data = combo.currentData() or {}
+        was_auto = old_data.get("type") == "auto"
+        old_path = old_data.get("path")
 
-            self._populate_model_combo(cid)
+        self._populate_model_combo(_UNIFIED_KEY)
 
-            if not was_auto and old_path:
-                # Re-select the same variant if still available
-                for i in range(combo.count()):
-                    d = combo.itemData(i) or {}
-                    if d.get("path") == old_path:
-                        combo.blockSignals(True)
-                        combo.setCurrentIndex(i)
-                        combo.blockSignals(False)
-                        self._state.model_paths[cid] = old_path
-                        self._prev_combo_idx[cid] = i
-                        break
+        if not was_auto and old_path:
+            for i in range(combo.count()):
+                d = combo.itemData(i) or {}
+                if d.get("path") == old_path:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(i)
+                    combo.blockSignals(False)
+                    self._mirror_unified_path(old_path)
+                    self._prev_combo_idx[_UNIFIED_KEY] = i
+                    break
         self._update_model_format_labels()
 
     def _set_model(self, cid: int, path: str) -> None:
@@ -2322,12 +2354,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_device_changed(self) -> None:
         device = str(self.deviceCombo.currentData() or "auto")
         self._state.set_device(device)
-        # Re-resolve auto models for the new device
-        for cid in TARGET_CLASS_IDS:
-            combo = self._mcombo[cid]
-            data = combo.currentData()
-            if data and data.get("type") == "auto":
-                self._resolve_auto_model(cid)
+        # Re-resolve auto model for the new device
+        combo = self._mcombo[_UNIFIED_KEY]
+        data = combo.currentData()
+        if data and data.get("type") == "auto":
+            self._resolve_auto_model(_UNIFIED_KEY)
         self._update_convert_buttons()
         self._update_model_format_labels()
         self._set_status(f"Device set to {device.upper()} (takes effect on next start)")
@@ -2349,6 +2380,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if enabled else "Overload highlighting off"
         )
 
+    def _on_db_logging_toggled(self, enabled: bool) -> None:
+        _sblog.set_enabled(bool(enabled))
+        if enabled and not _sblog.has_credentials():
+            self._set_status(
+                "DB logging requested but Supabase credentials are missing")
+        else:
+            self._set_status(
+                "DB logging (Supabase) enabled" if enabled
+                else "DB logging (Supabase) disabled"
+            )
+
     def _on_stride_changed(self, v: int) -> None:
         self.strideLabel.setText(str(v))
         self._state.set_inference_stride(v)
@@ -2361,88 +2403,79 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._get_effective_device()
 
     def _update_convert_buttons(self) -> None:
-        """Show / hide per-model convert buttons and the Optimize-All button."""
+        """Show / hide the unified convert button and the Optimize-All button."""
         rt = _detect_runtimes()
         has_cuda = self._has_cuda()
 
-        any_eligible = False
-        for cid in TARGET_CLASS_IDS:
-            group = self._model_groups.get(cid)
-            btn = self._mconv[cid]
+        probe_cid = next(iter(TARGET_CLASS_IDS))
+        group = self._model_groups.get(probe_cid)
+        btn = self._mconv[_UNIFIED_KEY]
 
-            if not group or not group.has_pt:
-                btn.setVisible(False)
-                continue
+        if not group or not group.has_pt:
+            btn.setVisible(False)
+            self.btnOptimizeAll.setVisible(False)
+            return
 
-            # Check what optimised formats already exist
-            gpu_done = (
-                (not has_cuda)
-                or (rt.best_gpu_format == "pt")
-                or bool(group.get_variant(rt.best_gpu_format))
-            )
-            cpu_done = (
-                (rt.best_cpu_format == "pt")
-                or bool(group.get_variant(rt.best_cpu_format))
-            )
-            all_done = gpu_done and cpu_done
-            no_runtime = (rt.best_gpu_format == "pt" and rt.best_cpu_format == "pt")
+        gpu_done = (
+            (not has_cuda)
+            or (rt.best_gpu_format == "pt")
+            or bool(group.get_variant(rt.best_gpu_format))
+        )
+        cpu_done = (
+            (rt.best_cpu_format == "pt")
+            or bool(group.get_variant(rt.best_cpu_format))
+        )
+        all_done = gpu_done and cpu_done
+        no_runtime = (rt.best_gpu_format == "pt" and rt.best_cpu_format == "pt")
 
-            if all_done:
-                btn.setVisible(True)
-                btn.setEnabled(False)
-                btn.setIcon(_fa("check-circle", "#4CAF50", int(11 * _S)))
-                btn.setToolTip("Fully optimised")
-            elif no_runtime:
-                btn.setVisible(True)
-                btn.setEnabled(False)
-                btn.setIcon(_fa("exclamation-triangle", "#888", int(11 * _S)))
-                btn.setToolTip("No optimisation runtime installed (tensorrt / openvino)")
-            else:
-                missing = []
-                if has_cuda and not gpu_done:
-                    missing.append("GPU")
-                if not cpu_done:
-                    missing.append("CPU")
-                btn.setVisible(True)
-                btn.setEnabled(True)
-                btn.setIcon(_fa("bolt", _TD, int(11 * _S)))
-                btn.setToolTip(f"Optimise for {', '.join(missing)}")
-                any_eligible = True
-
-        self.btnOptimizeAll.setVisible(any_eligible)
+        if all_done:
+            btn.setVisible(True)
+            btn.setEnabled(False)
+            btn.setIcon(_fa("check-circle", "#4CAF50", int(11 * _S)))
+            btn.setToolTip("Fully optimised")
+            self.btnOptimizeAll.setVisible(False)
+        elif no_runtime:
+            btn.setVisible(True)
+            btn.setEnabled(False)
+            btn.setIcon(_fa("exclamation-triangle", "#888", int(11 * _S)))
+            btn.setToolTip("No optimisation runtime installed (tensorrt / openvino)")
+            self.btnOptimizeAll.setVisible(False)
+        else:
+            missing = []
+            if has_cuda and not gpu_done:
+                missing.append("GPU")
+            if not cpu_done:
+                missing.append("CPU")
+            btn.setVisible(True)
+            btn.setEnabled(True)
+            btn.setIcon(_fa("bolt", _TD, int(11 * _S)))
+            btn.setToolTip(f"Optimise for {', '.join(missing)}")
+            self.btnOptimizeAll.setVisible(True)
 
     def _build_convert_jobs(self, cids=None):
-        """Return a list of ConvertJob tuples for eligible models."""
-        rt = _detect_runtimes()
-        if cids is None:
-            cids = TARGET_CLASS_IDS
+        """Return ConvertJob tuples for the unified detector (GPU + CPU)."""
+        probe_cid = next(iter(TARGET_CLASS_IDS))
+        group = self._model_groups.get(probe_cid)
+        if not group or not group.has_pt:
+            return []
+        pt_variant = group.get_variant("pt")
+        if not pt_variant:
+            return []
+
         imgsz = self._state.get_imgsz()
         has_cuda = self._has_cuda()
+        half = self._state.use_fp16()
         jobs = []
-
-        for cid in cids:
-            group = self._model_groups.get(cid)
-            if not group or not group.has_pt:
-                continue
-            pt_variant = group.get_variant("pt")
-            if not pt_variant:
-                continue
-
-            if has_cuda:
-                half = self._state.use_fp16()
-                jobs.append((cid, pt_variant.path, "cuda", imgsz, half))
-
-            # CPU job
-            half = self._state.use_fp16()
-            jobs.append((cid, pt_variant.path, "cpu", imgsz, half))
-
+        if has_cuda:
+            jobs.append((_UNIFIED_KEY, pt_variant.path, "cuda", imgsz, half))
+        jobs.append((_UNIFIED_KEY, pt_variant.path, "cpu", imgsz, half))
         return jobs
 
-    def _on_convert_model(self, cid: int) -> None:
-        """Start conversion for a single model (GPU + CPU)."""
-        jobs = self._build_convert_jobs(cids=[cid])
+    def _on_convert_model(self, cid: int = _UNIFIED_KEY) -> None:
+        """Start conversion of the unified detector (GPU + CPU)."""
+        jobs = self._build_convert_jobs()
         if not jobs:
-            self._set_status("Nothing to convert (already optimised or not a .pt model)")
+            self._set_status("Nothing to convert (already optimised or no .pt available)")
             return
         rt = _detect_runtimes()
         parts = []
@@ -2453,18 +2486,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_conversion(jobs)
 
     def _on_convert_all(self) -> None:
-        """Start conversion for every eligible model (GPU + CPU)."""
-        jobs = self._build_convert_jobs()
-        if not jobs:
-            self._set_status("All models already optimised")
-            return
-        rt = _detect_runtimes()
-        parts = []
-        if self._has_cuda():
-            parts.append(rt.gpu_summary)
-        parts.append(rt.cpu_summary)
-        self._set_status("Batch conversion started · " + " | ".join(parts))
-        self._start_conversion(jobs)
+        """Alias for _on_convert_model under the unified-detector layout."""
+        self._on_convert_model(_UNIFIED_KEY)
 
     def _start_conversion(self, jobs) -> None:
         if self._converter and self._converter.isRunning():
@@ -2479,8 +2502,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._converter.conversion_finished.connect(self._on_cvt_finished)
         self._converter.all_finished.connect(self._on_cvt_all_done)
         # Disable convert buttons while running
-        for cid in TARGET_CLASS_IDS:
-            self._mconv[cid].setEnabled(False)
+        self._mconv[_UNIFIED_KEY].setEnabled(False)
         self.btnOptimizeAll.setEnabled(False)
         self._converter.start()
 
@@ -2523,7 +2545,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if success:
             self._set_status(
-                f"{CLASS_NAMES.get(cid, '')} → {fmt_name} ✓  ({os.path.basename(result)})")
+                f"{CLASS_NAMES.get(cid, 'Unified Detector')} → {fmt_name} ✓  ({os.path.basename(result)})")
             btn = self._mconv.get(cid)
             if btn:
                 btn.setIcon(_fa("check-circle", "#4CAF50", int(11 * _S)))
@@ -2531,7 +2553,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn.setEnabled(False)
         else:
             self._set_status(
-                f"{CLASS_NAMES.get(cid, '')} conversion failed: {result.splitlines()[0]}")
+                f"{CLASS_NAMES.get(cid, 'Unified Detector')} conversion failed: {result.splitlines()[0]}")
             btn = self._mconv.get(cid)
             if btn:
                 btn.setIcon(_fa("exclamation-triangle", "#f44336", int(11 * _S)))
@@ -2544,8 +2566,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Re-discover models (new optimised variants now exist)
         self._refresh_model_combos()
         self._update_convert_buttons()
-        for cid in TARGET_CLASS_IDS:
-            self._mconv[cid].setEnabled(True)
+        self._mconv[_UNIFIED_KEY].setEnabled(True)
         self.btnOptimizeAll.setEnabled(True)
         # Tell inference engine to reload with the new optimised weights
         self._state.reload_models_flag = True

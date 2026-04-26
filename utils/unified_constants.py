@@ -19,10 +19,12 @@ The ``rider`` class is the noisiest due to inter-dataset annotation
 variance — treat its detections as slightly less reliable than the rest.
 """
 
-from typing import Dict, FrozenSet
+from typing import Dict
 
 
 # ── Frozen class index map ────────────────────────────────────────────────────
+# Includes ``tricycle`` because the trained weights emit it; downstream
+# code filters it out via ``config.TARGET_CLASS_IDS``.  Do not reorder.
 MASTER_CLASSES: Dict[int, str] = {
     0: "motorcycle",
     1: "rider",
@@ -38,25 +40,16 @@ MASTER_CLASS_IDS: Dict[str, int] = {v: k for k, v in MASTER_CLASSES.items()}
 
 
 # ── Semantic groupings ────────────────────────────────────────────────────────
-# Parent vehicles a rider can ride on.  Each parent has its own overload
-# threshold (LTO MC No. 2014-001).
-PARENT_VEHICLE_CLASSES: FrozenSet[int] = frozenset({
-    MASTER_CLASS_IDS["motorcycle"],
-    MASTER_CLASS_IDS["tricycle"],
-})
-
-# Maximum riders allowed per parent vehicle before flagging an overload.
-MAX_RIDERS_PER_VEHICLE: Dict[int, int] = {
-    MASTER_CLASS_IDS["motorcycle"]: 2,
-    MASTER_CLASS_IDS["tricycle"]: 4,   # driver + 3 sidecar passengers
-}
-
-# Gear classes that attach to a rider.
+# Riders are only associated with motorcycles.  Tricycles are detected
+# only so the model can distinguish them from motorcycles; their riders
+# are not part of the compliance pipeline.
 RIDER_CLASS: int = MASTER_CLASS_IDS["rider"]
+PARENT_VEHICLE_CLASS: int = MASTER_CLASS_IDS["motorcycle"]
 HELMET_POSITIVE_CLASS: int = MASTER_CLASS_IDS["helmet"]
 HELMET_NEGATIVE_CLASS: int = MASTER_CLASS_IDS["no_helmet"]
 FOOTWEAR_POSITIVE_CLASS: int = MASTER_CLASS_IDS["footwear"]
 FOOTWEAR_NEGATIVE_CLASS: int = MASTER_CLASS_IDS["improper_footwear"]
+FILLER_CLASS: int = MASTER_CLASS_IDS["tricycle"]
 
 
 # ── Default unified model location ────────────────────────────────────────────

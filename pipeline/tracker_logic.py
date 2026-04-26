@@ -13,7 +13,6 @@ import numpy as np
 from PyQt5 import QtCore
 
 from config import (
-    TARGET_CLASS_IDS,
     CLASS_NAMES,
     CLASS_COLORS_BGR,
     CLASS_MOTORCYCLE,
@@ -22,9 +21,6 @@ from config import (
     CLASS_NO_HELMET,
     CLASS_FOOTWEAR,
     CLASS_IMPROPER_FOOTWEAR,
-    CLASS_TRICYCLE,
-    PARENT_VEHICLE_CLASS_IDS,
-    MAX_RIDERS_PER_VEHICLE,
     COLOR_COMPLIANT_BGR,
     COLOR_NON_COMPLIANT_BGR,
     COLOR_OVERLOAD_BGR,
@@ -173,6 +169,7 @@ class TrackerLogicThread(QtCore.QThread):
             motorcycles = [d for d in dets if d.class_id == CLASS_MOTORCYCLE and d.confidence >= occlusion_thresh]
             riders      = [d for d in dets if d.class_id == CLASS_RIDER and d.confidence >= occlusion_thresh]
             helmets     = [d for d in dets if d.class_id == CLASS_HELMET and d.confidence >= occlusion_thresh]
+            no_helmets  = [d for d in dets if d.class_id == CLASS_NO_HELMET and d.confidence >= occlusion_thresh]
             footwear    = [d for d in dets if d.class_id == CLASS_FOOTWEAR and d.confidence >= occlusion_thresh]
             improper_fw = [d for d in dets if d.class_id == CLASS_IMPROPER_FOOTWEAR and d.confidence >= occlusion_thresh]
             invalid     = [d for d in dets if d.confidence < occlusion_thresh]
@@ -270,30 +267,35 @@ class TrackerLogicThread(QtCore.QThread):
                     rider_gear[best_ri]["improper_fw"] = True
                     matched_improper_fw.append(ifw)
 
-            # ── Check OVERLOAD (per-vehicle threshold) ────────────────────
-            # Motorcycle  -> 2 riders max
-            # Tricycle    -> 4 riders max (driver + 3 sidecar passengers)
+            # ── Check OVERLOAD ─────────────────────────────────────────────
+            # Motorcycle limit (LTO MC No. 2014-001): 2 riders max.
             overloaded_motos: Set[int] = set()
-            for vi, rider_list in moto_rider_map.items():
-                vehicle = vehicles[vi]
-                limit = MAX_RIDERS_PER_VEHICLE.get(
-                    vehicle.class_id,
-                    cfg.max_riders_per_motorcycle,
-                )
+            limit = cfg.max_riders_per_motorcycle
+            for mi, rider_list in moto_rider_map.items():
                 if len(rider_list) > limit:
-                    overloaded_motos.add(vi)
+                    overloaded_motos.add(mi)
 
             # ── Build stats dict ──────────────────────────────────────────
+            # Helmet semantics — positive evidence wins:
+            #   compliant  : `helmet` present (regardless of `no_helmet`)
+            #   violation  : `no_helmet` present AND `helmet` absent
+            #   unknown    : neither helmet nor no_helmet detected
             total_riders = len(matched_riders)
             helmeted = sum(1 for g in rider_gear.values() if g["helmet"])
-            no_helmet = sum(1 for g in rider_gear.values() if not g["helmet"])
+            no_helmet = sum(
+                1 for g in rider_gear.values()
+                if g["no_helmet"] and not g["helmet"]
+            )
+            helmet_unknown = sum(
+                1 for g in rider_gear.values()
+                if not g["helmet"] and not g["no_helmet"]
+            )
 
             fw_ok = sum(1 for g in rider_gear.values() if g["footwear_ok"] and not g["improper_fw"])
             improper_riders = sum(1 for g in rider_gear.values() if g["improper_fw"])
-            
-            # Since we only consider IMPROPER_footwear as non-compliant, missing both just means unknown but not strictly non-compliant
+
+            # Footwear: missing both detections means "unknown" — not a strict violation.
             fw_unknown = sum(1 for g in rider_gear.values() if (not g["footwear_ok"]) and (not g["improper_fw"]))
-            helmet_unknown = 0 # According to rules, missing helmet = no_helmet
 
             overloaded_rider_ids = {
                 id(r)
@@ -306,8 +308,7 @@ class TrackerLogicThread(QtCore.QThread):
                 if id(rider) in overloaded_rider_ids:
                     continue
                 g = rider_gear.get(ri, {})
-                # Helmet rule: compliant ONLY if helmet IS present
-                # Footwear rule: non-compliant ONLY if improper_fw is present
+                # Compliant ONLY if helmet IS present and no improper footwear seen.
                 if g.get("helmet") and not g.get("improper_fw"):
                     compliant_riders += 1
 
@@ -354,7 +355,11 @@ class TrackerLogicThread(QtCore.QThread):
                         continue
                     g = rider_gear.get(ri, {})
                     rider_tid = rider.track_id
-                    if not g.get("helmet"):
+                    # Helmet violation requires POSITIVE no_helmet evidence;
+                    # absence of a helmet detection alone (e.g. occlusion)
+                    # does not count.  Positive helmet evidence wins over
+                    # an overlapping no_helmet detection.
+                    if g.get("no_helmet") and not g.get("helmet"):
                         self.violation_detected.emit({
                             "violation_type": "no_helmet",
                             "motorcycle_id": moto_tid,
@@ -386,70 +391,73 @@ class TrackerLogicThread(QtCore.QThread):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1, cv2.LINE_AA,
                     )
 
-                # Vehicles (motorcycles + tricycles)
-                for vi, vehicle in enumerate(vehicles):
-                    is_overloaded = vi in overloaded_motos
-                    base_color = class_colors.get(
-                        vehicle.class_id,
-                        CLASS_COLORS_BGR.get(vehicle.class_id, (255, 255, 255)),
-                    )
-                    color = COLOR_OVERLOAD_BGR if is_overloaded else base_color
+                # Motorcycles — box stays the class colour; an overload
+                # icon is appended beside the label instead of recolouring
+                # the whole bounding box.
+                base_moto_color = class_colors.get(
+                    CLASS_MOTORCYCLE,
+                    CLASS_COLORS_BGR.get(CLASS_MOTORCYCLE, (255, 255, 255)),
+                )
+                for mi, moto in enumerate(motorcycles):
+                    is_overloaded = mi in overloaded_motos
                     cv2.rectangle(
                         annotated,
-                        (vehicle.x1, vehicle.y1),
-                        (vehicle.x2, vehicle.y2),
-                        color, 2,
+                        (moto.x1, moto.y1),
+                        (moto.x2, moto.y2),
+                        base_moto_color, 2,
                     )
-                    label = CLASS_NAMES.get(vehicle.class_id, "Vehicle")
+                    label = CLASS_NAMES.get(CLASS_MOTORCYCLE, "Motorcycle")
+                    moto_icons = []
                     if is_overloaded:
-                        label += f" OVERLOAD ({len(moto_rider_map[vi])} riders)"
-                    _draw_label(
-                        annotated, f"{label} {vehicle.confidence:.2f}",
-                        vehicle.x1, vehicle.y1, color,
+                        moto_icons.append(("overload",
+                                           len(moto_rider_map[mi])))
+                    _draw_label_with_icons(
+                        annotated,
+                        f"{label} {moto.confidence:.2f}",
+                        moto.x1, moto.y1,
+                        base_moto_color,
+                        moto_icons,
                     )
 
-                # Riders (with compliance status)
+                # Riders — box always uses the rider class colour. Compliance
+                # is communicated through icon badges beside the label.
+                base_rider_color = class_colors.get(
+                    CLASS_RIDER,
+                    CLASS_COLORS_BGR.get(CLASS_RIDER, (255, 255, 255)),
+                )
                 for ri, rider in enumerate(matched_riders):
                     gear = rider_gear.get(ri, {})
-                    violations: List[str] = []
-                    unknowns: List[str] = []
-                    if gear.get("improper_fw"):
-                        violations.append("BAD FOOTWEAR")
-                    if gear.get("no_helmet") and not gear.get("helmet"):
-                        violations.append("NO HELMET")
 
-                    if (not gear.get("helmet")) and (not gear.get("no_helmet")):
-                        unknowns.append("HELMET ?")
-                    if (not gear.get("footwear_ok")) and (not gear.get("improper_fw")):
-                        unknowns.append("FOOTWEAR ?")
-
-                    # Check if on overloaded motorcycle
-                    on_overloaded = id(rider) in overloaded_rider_ids
-
-                    if on_overloaded:
-                        color = COLOR_OVERLOAD_BGR
-                        violations.insert(0, "OVERLOAD")
-                    elif violations:
-                        color = COLOR_NON_COMPLIANT_BGR
-                    elif unknowns:
-                        color = COLOR_UNKNOWN_BGR
-                    else:
-                        color = COLOR_COMPLIANT_BGR
-
-                    cv2.rectangle(annotated, (rider.x1, rider.y1), (rider.x2, rider.y2), color, 2)
-                    tid_str = f" ID:{rider.track_id}" if rider.track_id is not None else ""
-                    _draw_label(
-                        annotated, f"Rider{tid_str} {rider.confidence:.2f}",
-                        rider.x1, rider.y1, color,
+                    helmet_status = _gear_status(
+                        ok=gear.get("helmet"),
+                        bad=gear.get("no_helmet") and not gear.get("helmet"),
                     )
-                    if violations or unknowns:
-                        status_txt = " | ".join(violations + unknowns)
-                        status_color = color if violations else COLOR_UNKNOWN_BGR
-                        cv2.putText(
-                            annotated, status_txt,
-                            (rider.x1, rider.y2 + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, status_color, 2, cv2.LINE_AA,
-                        )
+                    fw_status = _gear_status(
+                        ok=gear.get("footwear_ok") and not gear.get("improper_fw"),
+                        bad=gear.get("improper_fw"),
+                    )
+
+                    rider_icons = [
+                        ("helmet", helmet_status),
+                        ("shoe",   fw_status),
+                    ]
+                    if id(rider) in overloaded_rider_ids:
+                        rider_icons.append(("overload", "bad"))
+
+                    cv2.rectangle(
+                        annotated,
+                        (rider.x1, rider.y1),
+                        (rider.x2, rider.y2),
+                        base_rider_color, 2,
+                    )
+                    tid_str = f" ID:{rider.track_id}" if rider.track_id is not None else ""
+                    _draw_label_with_icons(
+                        annotated,
+                        f"Rider{tid_str} {rider.confidence:.2f}",
+                        rider.x1, rider.y1,
+                        base_rider_color,
+                        rider_icons,
+                    )
 
                 # Gear boxes: only draw associated ones
                 gear_dets = (
@@ -494,3 +502,162 @@ def _draw_label(
         img, text, (x + 2, ty + th + 3),
         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 1, cv2.LINE_AA,
     )
+
+
+# ── Status icons (drawn beside labels) ─────────────────────────────────────────
+
+# Status string vocabulary used by the icon drawer.
+_STATUS_OK      = "ok"
+_STATUS_BAD     = "bad"
+_STATUS_UNKNOWN = "unknown"
+
+_STATUS_FILL_BGR: Dict[str, Tuple[int, int, int]] = {
+    _STATUS_OK:      COLOR_COMPLIANT_BGR,
+    _STATUS_BAD:     COLOR_NON_COMPLIANT_BGR,
+    _STATUS_UNKNOWN: COLOR_UNKNOWN_BGR,
+}
+
+
+def _gear_status(ok: bool, bad: bool) -> str:
+    """Collapse (ok, bad) flags into one of the three status strings."""
+    if ok:
+        return _STATUS_OK
+    if bad:
+        return _STATUS_BAD
+    return _STATUS_UNKNOWN
+
+
+def _draw_icon_badge(
+    img: np.ndarray,
+    cx: int,
+    cy: int,
+    radius: int,
+    kind: str,
+    status: str,
+) -> None:
+    """Draw a single coloured circular badge with a glyph for *kind*.
+
+    *kind* is one of ``"helmet"`` / ``"shoe"`` / ``"overload"``.
+    *status* picks the fill colour.
+    """
+    fill = _STATUS_FILL_BGR.get(status, COLOR_UNKNOWN_BGR)
+    fg = (0, 0, 0)  # icon ink is always near-black for contrast on bright fills
+    # Backing circle
+    cv2.circle(img, (cx, cy), radius, fill, -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), radius, (0, 0, 0), 1, cv2.LINE_AA)
+
+    if status == _STATUS_UNKNOWN:
+        # Render "?" centred regardless of which gear kind.
+        text = "?"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.putText(
+            img, text,
+            (cx - tw // 2, cy + th // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, fg, 2, cv2.LINE_AA,
+        )
+        return
+
+    if kind == "helmet":
+        # Dome (upper semicircle) + chin strap line.
+        cv2.ellipse(
+            img, (cx, cy + 1), (radius - 4, radius - 4),
+            0, 180, 360, fg, -1, cv2.LINE_AA,
+        )
+        cv2.line(
+            img, (cx - radius + 4, cy + 2), (cx + radius - 4, cy + 2),
+            fg, 1, cv2.LINE_AA,
+        )
+    elif kind == "shoe":
+        # Stylised shoe: filled rounded sole + heel rectangle.
+        sole_y1 = cy + 1
+        sole_y2 = cy + 4
+        cv2.rectangle(
+            img, (cx - radius + 3, sole_y1), (cx + radius - 3, sole_y2),
+            fg, -1, cv2.LINE_AA,
+        )
+        # Toe box / upper
+        cv2.rectangle(
+            img, (cx - radius + 3, cy - 3), (cx + 1, sole_y1),
+            fg, -1, cv2.LINE_AA,
+        )
+    elif kind == "overload":
+        # Triangle with exclamation mark.
+        pts = np.array([
+            [cx, cy - radius + 3],
+            [cx - radius + 3, cy + radius - 4],
+            [cx + radius - 3, cy + radius - 4],
+        ], np.int32)
+        cv2.fillPoly(img, [pts], fg, cv2.LINE_AA)
+        # Exclamation mark in the lighter fill colour.
+        cv2.line(
+            img, (cx, cy - 2), (cx, cy + 2),
+            fill, 2, cv2.LINE_AA,
+        )
+        cv2.circle(img, (cx, cy + 4), 1, fill, -1, cv2.LINE_AA)
+
+
+def _draw_label_with_icons(
+    img: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    color: Tuple[int, int, int],
+    icons: List[Tuple[str, object]],
+) -> None:
+    """Draw *text* like ``_draw_label`` but with status icons appended.
+
+    *icons* is a list of ``(kind, status_or_value)`` tuples. ``kind`` is one
+    of ``"helmet"`` / ``"shoe"`` / ``"overload"``. For helmet/shoe the value
+    is one of the ``_STATUS_*`` strings. For ``"overload"`` on the
+    motorcycle the value is the rider count (int) — the badge always shows
+    in the BAD colour and the count is appended after the badges.
+    """
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+    icon_r = max(7, (th + 6) // 2)
+    icon_diam = icon_r * 2
+    icon_gap = 4
+    pad_x = 4
+
+    # Pre-compute trailing rider-count text for overload-on-motorcycle case.
+    trailing_text = ""
+    badge_count = 0
+    for kind, value in icons:
+        if kind == "overload" and isinstance(value, int):
+            trailing_text = f" x{value}"
+        badge_count += 1
+
+    (ttw, tth), _ = cv2.getTextSize(
+        trailing_text, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1
+    ) if trailing_text else ((0, 0), 0)
+
+    extras_w = (
+        (icon_diam + icon_gap) * badge_count + ttw
+        if badge_count else 0
+    )
+
+    band_h = max(th + 6, icon_diam + 4)
+    band_w = tw + pad_x * 2 + extras_w
+    ty = max(0, y - band_h)
+    cv2.rectangle(img, (x, ty), (x + band_w, ty + band_h), color, -1)
+
+    # Text baseline centred vertically inside the band.
+    text_y = ty + (band_h + th) // 2 - 1
+    cv2.putText(
+        img, text, (x + pad_x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 1, cv2.LINE_AA,
+    )
+
+    # Draw badges to the right of the text, vertically centred in the band.
+    cx = x + pad_x + tw + icon_gap + icon_r
+    cy = ty + band_h // 2
+    for kind, value in icons:
+        status = value if isinstance(value, str) else _STATUS_BAD
+        _draw_icon_badge(img, cx, cy, icon_r, kind, status)
+        cx += icon_diam + icon_gap
+
+    if trailing_text:
+        cv2.putText(
+            img, trailing_text,
+            (cx - icon_gap, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 1, cv2.LINE_AA,
+        )

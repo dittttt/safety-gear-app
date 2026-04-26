@@ -257,24 +257,68 @@ class InferenceThread(QtCore.QThread):
 
     def _predict_kwargs(self, conf: float, iou: float, imgsz: int) -> dict:
         """Backend-aware kwargs for the unified detector."""
+        path = str(self._model_paths.get(self.UNIFIED_KEY, "")).lower()
+
+        # TensorRT engines bake the input resolution in at export time. Trying
+        # to predict at any other ``imgsz`` raises a runtime error and the
+        # whole frame returns no detections — which the user perceives as
+        # "detection just stopped working" the moment they touched the
+        # inference-size dropdown. Snap to whatever the engine was built
+        # for. OpenVINO IR has the same constraint (the static shape lives
+        # in the .xml).
+        if path.endswith(".engine") or self._is_openvino_path(
+            self._model_paths.get(self.UNIFIED_KEY, "")
+        ):
+            engine_imgsz = self._native_imgsz()
+            if engine_imgsz and engine_imgsz != imgsz:
+                imgsz = engine_imgsz
+
         kwargs = {
             "conf": conf,
             "iou": iou,
             "imgsz": imgsz,
             "verbose": False,
         }
-        path = str(self._model_paths.get(self.UNIFIED_KEY, "")).lower()
         if path.endswith(".pt"):
             kwargs["device"] = self._device
             kwargs["half"] = self._fp16
         return kwargs
 
+    def _native_imgsz(self) -> Optional[int]:
+        """Best-effort lookup of the model's baked-in input size."""
+        model = self._models.get(self.UNIFIED_KEY)
+        if model is None:
+            return None
+        # Ultralytics records the export-time imgsz in ``overrides``.
+        try:
+            sz = getattr(model, "overrides", {}).get("imgsz")
+            if isinstance(sz, (list, tuple)) and sz:
+                return int(sz[0])
+            if isinstance(sz, (int, float)):
+                return int(sz)
+        except Exception:
+            pass
+        # Fall back to the framework default for our exports.
+        return 640
+
     def _predict_unified(self, frames: List[np.ndarray], kwargs: dict):
-        """Run the unified model once on a list of frames."""
+        """Run the unified model once on a list of frames.
+
+        When tracking is enabled (the default), uses ``model.track()`` so the
+        configured BoT-SORT/ByteTrack instance assigns stable IDs across
+        frames. Tracking is inherently stateful → frames must be processed
+        one-at-a-time even if predict() would happily batch them.
+        """
         model = self._models.get(self.UNIFIED_KEY)
         if model is None:
             return [None] * len(frames)
         path = self._model_paths.get(self.UNIFIED_KEY, "")
+
+        tracker_cfg = self._resolve_tracker_config()
+        if tracker_cfg:
+            return self._track_frames(model, frames, kwargs, tracker_cfg)
+
+        # Tracking disabled → fall back to plain prediction (no IDs).
         allow_batch = not self._is_openvino_path(path)
         if allow_batch:
             try:
@@ -290,6 +334,56 @@ class InferenceThread(QtCore.QThread):
                 out.append(r[0] if isinstance(r, (list, tuple)) and r else r)
             except Exception:
                 out.append(None)
+        return out
+
+    def _resolve_tracker_config(self) -> Optional[str]:
+        """Return an absolute path to the active tracker YAML, if any."""
+        cfg = self._state.detection_config
+        key = (getattr(cfg, "tracker_key", None) or "").strip().lower()
+        if not key or key in {"none", "off", "disabled"}:
+            return None
+        # trackers/ lives at the repo root next to main.py.
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(repo_root, "trackers", f"{key}.yaml")
+        return path if os.path.isfile(path) else None
+
+    def _track_frames(
+        self,
+        model: YOLO,
+        frames: List[np.ndarray],
+        kwargs: dict,
+        tracker_cfg: str,
+    ) -> List:
+        """Run frame-by-frame tracking, respecting the reset flag."""
+        # Tracking-only kwargs. ``model.track()`` does not accept ``half`` for
+        # all backends; predict() does. Strip it to avoid a TypeError on some
+        # Ultralytics versions.
+        track_kwargs = dict(kwargs)
+        track_kwargs.pop("half", None)
+        track_kwargs["tracker"] = tracker_cfg
+
+        out: List = []
+        for frame in frames:
+            # A pending reset means we just seeked or switched source — wipe
+            # the tracker's internal state on the very next call by passing
+            # persist=False ONCE, then resume with persist=True.
+            persist = True
+            if self._state.reset_tracker_flag:
+                self._state.reset_tracker_flag = False
+                persist = False
+            try:
+                r = model.track(frame, persist=persist, **track_kwargs)
+                out.append(r[0] if isinstance(r, (list, tuple)) and r else r)
+            except Exception as exc:
+                # If tracking fails (e.g. backend doesn't support it), fall
+                # back to plain prediction for this frame so the pipeline
+                # keeps producing detections.
+                self.status.emit(f"Tracker error, falling back to predict: {exc}")
+                try:
+                    rp = model.predict(frame, **kwargs)
+                    out.append(rp[0] if isinstance(rp, (list, tuple)) and rp else rp)
+                except Exception:
+                    out.append(None)
         return out
 
     # ── Detection extraction helpers ───────────────────────────────────────────

@@ -23,7 +23,6 @@ call to :func:`discover_models`.
 from __future__ import annotations
 
 import os
-import shutil
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -31,11 +30,6 @@ from config import DEFAULT_MODEL_FILES
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(_ROOT, "models")
-
-# Reverse map: stem → class-id
-_STEM_TO_CID: Dict[str, int] = {
-    os.path.splitext(fn)[0]: cid for cid, fn in DEFAULT_MODEL_FILES.items()
-}
 
 _FORMAT_LABEL: Dict[str, str] = {
     "pt": "PyTorch",
@@ -150,88 +144,7 @@ def model_dir_for(stem: str) -> str:
     return os.path.join(MODELS_DIR, stem)
 
 
-# ── migration ────────────────────────────────────────────────────────────────
-
-def migrate_old_structure() -> bool:
-    """
-    Move files from the legacy flat / ``optimized/`` layout into per-model
-    directories.  Returns ``True`` if anything was moved.
-
-    Legacy layout (before)::
-
-        models/motorcycle.pt
-        models/optimized/GPU/motorcycle.engine
-        models/optimized/CPU/motorcycle_openvino_model/
-
-    New layout (after)::
-
-        models/motorcycle/motorcycle.pt
-        models/motorcycle/motorcycle.engine
-        models/motorcycle/motorcycle_openvino_model/
-    """
-    if not os.path.isdir(MODELS_DIR):
-        return False
-
-    old_gpu = os.path.join(MODELS_DIR, "optimized", "GPU")
-    old_cpu = os.path.join(MODELS_DIR, "optimized", "CPU")
-    moved = False
-
-    for _cid, fn in DEFAULT_MODEL_FILES.items():
-        stem = os.path.splitext(fn)[0]
-        dest = model_dir_for(stem)
-
-        # .pt — flat models/ → models/<stem>/
-        src = os.path.join(MODELS_DIR, fn)
-        dst = os.path.join(dest, fn)
-        if os.path.isfile(src) and not os.path.isfile(dst):
-            os.makedirs(dest, exist_ok=True)
-            shutil.move(src, dst)
-            moved = True
-
-        # .engine — optimized/GPU/ → models/<stem>/
-        for ext in (".engine", ".onnx"):
-            src = os.path.join(old_gpu, f"{stem}{ext}")
-            dst = os.path.join(dest, f"{stem}{ext}")
-            if os.path.isfile(src) and not os.path.isfile(dst):
-                os.makedirs(dest, exist_ok=True)
-                shutil.move(src, dst)
-                moved = True
-
-        # .onnx CPU
-        src = os.path.join(old_cpu, f"{stem}.onnx")
-        dst = os.path.join(dest, f"{stem}.onnx")
-        if os.path.isfile(src) and not os.path.isfile(dst):
-            os.makedirs(dest, exist_ok=True)
-            shutil.move(src, dst)
-            moved = True
-
-        # OpenVINO directory
-        src = os.path.join(old_cpu, f"{stem}_openvino_model")
-        dst = os.path.join(dest, f"{stem}_openvino_model")
-        if os.path.isdir(src) and not os.path.isdir(dst):
-            os.makedirs(dest, exist_ok=True)
-            shutil.move(src, dst)
-            moved = True
-
-    # Remove empty legacy directories
-    if moved:
-        for d in (old_gpu, old_cpu):
-            try:
-                if os.path.isdir(d) and not os.listdir(d):
-                    os.rmdir(d)
-            except OSError:
-                pass
-        opt = os.path.join(MODELS_DIR, "optimized")
-        try:
-            if os.path.isdir(opt) and not os.listdir(opt):
-                os.rmdir(opt)
-        except OSError:
-            pass
-
-    return moved
-
-
-# ── discovery ────────────────────────────────────────────────────────────────
+# ── discovery ───────────────────────────────────────────────────────────────────
 
 def cleanup_onnx_artifacts() -> int:
     """Remove every leftover ``.onnx`` file under ``models/``.
@@ -261,15 +174,13 @@ def cleanup_onnx_artifacts() -> int:
 
 def discover_models() -> Dict[int, ModelGroup]:
     """
-    Scan ``models/`` and return ``{class_id: ModelGroup}``.
+    Return ``{class_id: ModelGroup}`` by scanning ``models/unified/``.
 
-    The pipeline now uses a single unified ``best.pt`` detector that emits
-    every class.  We therefore look for artifacts under ``models/unified/``
-    and return the same set of variants for every ``class_id`` in
-    ``DEFAULT_MODEL_FILES``.
+    The pipeline uses a single unified ``best.pt`` detector that emits
+    every class, so every ``class_id`` in ``DEFAULT_MODEL_FILES`` is
+    backed by the same set of variants (``.pt`` / ``.engine`` /
+    ``.onnx`` / OpenVINO directory).
     """
-    migrate_old_structure()
-
     unified_dir = os.path.join(MODELS_DIR, "unified")
     variants: List[ModelVariant] = []
     if os.path.isdir(unified_dir):

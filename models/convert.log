@@ -129,3 +129,24 @@ stdout-json={"ok": false, "error": "No module named 'tensorrt'", "tb": "Tracebac
 02:17:24 INFO [10/10] Job start: cid=4  file=improper_footwear.pt  device=cpu  fmt=openvino
 02:17:24 INFO [10/10] Exporting improper_footwear → OPENVINO (imgsz=640)
 02:17:31 INFO Export OK in 7.1s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\improper_footwear\improper_footwear_openvino_model
+14:00:20 INFO ConvertWorker starting — 2 job(s)
+14:00:20 INFO [1/2] Job start: cid=-1  file=best.pt  device=cuda  fmt=engine
+14:00:20 INFO [1/2] Exporting best → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+14:04:42 INFO Export OK in 261.9s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\best\best.engine
+14:04:42 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
+14:04:42 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
+14:04:49 INFO Export OK in 7.8s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\best\best_openvino_model
+14:09:40 INFO ConvertWorker starting — 2 job(s)
+14:09:40 INFO [1/2] Job start: cid=-1  file=best.pt  device=cuda  fmt=engine
+14:09:40 INFO [1/2] Exporting best → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+14:13:59 INFO Export OK in 258.1s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\best\best.engine
+14:13:59 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
+14:13:59 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
+14:14:07 INFO Export OK in 8.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\best\best_openvino_model
+14:34:21 INFO ConvertWorker starting — 2 job(s)
+14:34:21 INFO [1/2] Job start: cid=-1  file=best.pt  device=cuda  fmt=engine
+14:34:21 INFO [1/2] Exporting best → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+14:38:42 INFO Export OK in 261.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best.engine
+14:38:42 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
+14:38:42 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
+14:38:51 INFO Export OK in 8.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best_openvino_model

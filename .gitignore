@@ -22,5 +22,13 @@ ENV/
 # Model weights (remove this if you want to commit .pt files)
 *.pt
 
+# Optimised / machine-specific model artifacts (regenerable via the
+# in-app "Optimize Unified Detector" button; TRT engines are tied to
+# the host GPU + driver, OpenVINO IR + ONNX are large derived files).
+*.engine
+*.onnx
+**/*_openvino_model/
+**/*_OV_model/
+
 # Ultralytics outputs
 runs/

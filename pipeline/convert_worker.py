@@ -89,9 +89,9 @@ class ConvertWorker(QtCore.QThread):
     # ── helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _target_dir(stem: str) -> str:
-        from utils.model_registry import model_dir_for
-        return model_dir_for(stem)
+    def _target_dir(pt_path: str) -> str:
+        """Export alongside the source ``.pt`` (so unified models stay in\n        ``models/unified/`` instead of being moved into ``models/<stem>/``).\n        """
+        return os.path.dirname(os.path.abspath(pt_path))
 
     @staticmethod
     def _best_format(device_key: str) -> str:
@@ -212,7 +212,7 @@ class ConvertWorker(QtCore.QThread):
 
             basename = os.path.splitext(os.path.basename(pt_path))[0]
             fmt = self._best_format(device_key)
-            target_dir = self._target_dir(basename)
+            target_dir = self._target_dir(pt_path)
 
             # If TRT already failed once, skip straight to ONNX fallback
             if fmt == "engine" and self._trt_failed:

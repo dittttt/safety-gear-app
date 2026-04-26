@@ -45,7 +45,8 @@ from typing import Any, Callable, Dict, Optional
 _SUPABASE_URL: str = ""
 _SUPABASE_KEY: str = ""
 _TABLE: str = "compliance_logs"
-_ENABLED: bool = False
+_HAS_CREDENTIALS: bool = False
+_USER_ENABLED: bool = True
 
 DEDUP_WINDOW_S: float = 8.0
 """Suppress repeat events for the same (moto_id, type) inside this window."""
@@ -80,17 +81,31 @@ def configure(url: str, anon_key: str,
               table: str = "compliance_logs",
               status_cb: Optional[Callable[[str, str], None]] = None) -> None:
     """Initialise (or reconfigure) the Supabase connection."""
-    global _SUPABASE_URL, _SUPABASE_KEY, _TABLE, _ENABLED, _status_cb
+    global _SUPABASE_URL, _SUPABASE_KEY, _TABLE, _HAS_CREDENTIALS, _status_cb
     _SUPABASE_URL = (url or "").rstrip("/")
     _SUPABASE_KEY = anon_key or ""
     _TABLE = table
-    _ENABLED = bool(_SUPABASE_URL and _SUPABASE_KEY)
+    _HAS_CREDENTIALS = bool(_SUPABASE_URL and _SUPABASE_KEY)
     _status_cb = status_cb
     _ensure_worker()
 
 
 def is_enabled() -> bool:
-    return _ENABLED
+    return _HAS_CREDENTIALS and _USER_ENABLED
+
+
+def has_credentials() -> bool:
+    return _HAS_CREDENTIALS
+
+
+def set_enabled(enabled: bool) -> None:
+    """User-facing on/off toggle for DB logging.
+
+    When credentials are missing this still records the user's preference
+    but ``is_enabled()`` will keep returning False.
+    """
+    global _USER_ENABLED
+    _USER_ENABLED = bool(enabled)
 
 
 def shutdown(timeout: float = 1.0) -> None:
@@ -103,7 +118,7 @@ def shutdown(timeout: float = 1.0) -> None:
 
 def submit(event: ViolationEvent) -> bool:
     """Queue an event for upload.  Returns False if deduped or disabled."""
-    if not _ENABLED:
+    if not is_enabled():
         return False
 
     key = f"{event.violation_type}:{event.motorcycle_id}:{event.rider_id}"
@@ -148,7 +163,7 @@ def _worker_loop() -> None:
             ev = _q.get(timeout=0.5)
         except queue.Empty:
             continue
-        if not _ENABLED:
+        if not is_enabled():
             continue
         ok, detail = _post_event(ev)
         if not ok and _status_cb is not None:

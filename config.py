@@ -12,15 +12,19 @@ from typing import Dict, Tuple
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ── Class IDs ──────────────────────────────────────────────────────────────────
-# Indices are FROZEN to match the unified ``best.pt`` model.
-# See utils/unified_constants.py for the authoritative master list.
+# The unified ``best.pt`` detector emits SEVEN classes (indices FROZEN to
+# match the trained weights — see utils/unified_constants.MASTER_CLASSES).
+# The seventh class — ``tricycle`` (id 6) — exists purely so the model can
+# disambiguate motorcycles from tricycles during training and is filtered
+# out of the downstream pipeline; it never appears in the UI, stats, or
+# violations.  Compliance logic operates on the six user-facing classes
+# below.
 CLASS_MOTORCYCLE = 0
 CLASS_RIDER = 1
 CLASS_HELMET = 2
 CLASS_NO_HELMET = 3
 CLASS_FOOTWEAR = 4
 CLASS_IMPROPER_FOOTWEAR = 5
-CLASS_TRICYCLE = 6
 
 TARGET_CLASS_IDS: Tuple[int, ...] = (
     CLASS_MOTORCYCLE,
@@ -29,17 +33,7 @@ TARGET_CLASS_IDS: Tuple[int, ...] = (
     CLASS_NO_HELMET,
     CLASS_FOOTWEAR,
     CLASS_IMPROPER_FOOTWEAR,
-    CLASS_TRICYCLE,
 )
-
-# Vehicles a rider can be associated with for compliance checks.
-PARENT_VEHICLE_CLASS_IDS: Tuple[int, ...] = (CLASS_MOTORCYCLE, CLASS_TRICYCLE)
-
-# Per-vehicle overload thresholds (LTO MC No. 2014-001).
-MAX_RIDERS_PER_VEHICLE: Dict[int, int] = {
-    CLASS_MOTORCYCLE: 2,
-    CLASS_TRICYCLE: 4,   # driver + 3 sidecar passengers
-}
 
 CLASS_NAMES: Dict[int, str] = {
     CLASS_MOTORCYCLE: "Motorcycle",
@@ -48,7 +42,6 @@ CLASS_NAMES: Dict[int, str] = {
     CLASS_NO_HELMET: "No Helmet",
     CLASS_FOOTWEAR: "Footwear",
     CLASS_IMPROPER_FOOTWEAR: "Improper Footwear",
-    CLASS_TRICYCLE: "Tricycle",
 }
 
 # BGR colours for bounding boxes
@@ -59,7 +52,6 @@ CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
     CLASS_NO_HELMET: (0, 0, 255),            # Red
     CLASS_FOOTWEAR: (0, 255, 0),             # Green
     CLASS_IMPROPER_FOOTWEAR: (0, 0, 255),    # Red
-    CLASS_TRICYCLE: (255, 200, 0),           # Aqua
 }
 
 # Compliance overlay colours
@@ -86,7 +78,7 @@ class DetectionConfig:
     rider_moto_ioa_thresh: float = 0.05
     gear_rider_ioa_thresh: float = 0.10
     occlusion_conf_thresh: float = 0.10
-    max_riders_per_motorcycle: int = 2   # legacy default; per-vehicle overrides live in MAX_RIDERS_PER_VEHICLE
+    max_riders_per_motorcycle: int = 2
     # Minimum confidence required on a `no_helmet` detection before flagging
     # the rider as non-compliant.  Helps reject low-quality false positives.
     no_helmet_min_conf: float = 0.40
