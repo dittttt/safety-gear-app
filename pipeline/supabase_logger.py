@@ -64,7 +64,6 @@ class ViolationEvent:
     notes: Optional[str] = None
     video_timestamp: Optional[float] = None
 
-
 # ── module state ──────────────────────────────────────────────────────────────
 
 _q: "queue.Queue[ViolationEvent]" = queue.Queue(maxsize=512)
