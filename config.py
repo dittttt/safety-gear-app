@@ -12,35 +12,54 @@ from typing import Dict, Tuple
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ── Class IDs ──────────────────────────────────────────────────────────────────
+# Indices are FROZEN to match the unified ``best.pt`` model.
+# See utils/unified_constants.py for the authoritative master list.
 CLASS_MOTORCYCLE = 0
 CLASS_RIDER = 1
 CLASS_HELMET = 2
-CLASS_FOOTWEAR = 3
-CLASS_IMPROPER_FOOTWEAR = 4
+CLASS_NO_HELMET = 3
+CLASS_FOOTWEAR = 4
+CLASS_IMPROPER_FOOTWEAR = 5
+CLASS_TRICYCLE = 6
 
 TARGET_CLASS_IDS: Tuple[int, ...] = (
     CLASS_MOTORCYCLE,
     CLASS_RIDER,
     CLASS_HELMET,
+    CLASS_NO_HELMET,
     CLASS_FOOTWEAR,
     CLASS_IMPROPER_FOOTWEAR,
+    CLASS_TRICYCLE,
 )
+
+# Vehicles a rider can be associated with for compliance checks.
+PARENT_VEHICLE_CLASS_IDS: Tuple[int, ...] = (CLASS_MOTORCYCLE, CLASS_TRICYCLE)
+
+# Per-vehicle overload thresholds (LTO MC No. 2014-001).
+MAX_RIDERS_PER_VEHICLE: Dict[int, int] = {
+    CLASS_MOTORCYCLE: 2,
+    CLASS_TRICYCLE: 4,   # driver + 3 sidecar passengers
+}
 
 CLASS_NAMES: Dict[int, str] = {
     CLASS_MOTORCYCLE: "Motorcycle",
     CLASS_RIDER: "Rider",
     CLASS_HELMET: "Helmet",
+    CLASS_NO_HELMET: "No Helmet",
     CLASS_FOOTWEAR: "Footwear",
     CLASS_IMPROPER_FOOTWEAR: "Improper Footwear",
+    CLASS_TRICYCLE: "Tricycle",
 }
 
 # BGR colours for bounding boxes
 CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
-    CLASS_MOTORCYCLE: (255, 255, 0),         # Light Blue
+    CLASS_MOTORCYCLE: (255, 255, 0),         # Cyan
     CLASS_RIDER: (255, 0, 0),                # Blue
     CLASS_HELMET: (0, 255, 0),               # Green
+    CLASS_NO_HELMET: (0, 0, 255),            # Red
     CLASS_FOOTWEAR: (0, 255, 0),             # Green
     CLASS_IMPROPER_FOOTWEAR: (0, 0, 255),    # Red
+    CLASS_TRICYCLE: (255, 200, 0),           # Aqua
 }
 
 # Compliance overlay colours
@@ -59,7 +78,7 @@ class DetectionConfig:
     """Mutable detection settings shared across threads."""
     conf: float = 0.25
     iou: float = 0.30
-    imgsz: int = 480
+    imgsz: int = 640
     inference_batch_size: int = 4
     inference_stride: int = 2
     use_fp16: bool = False
@@ -67,21 +86,22 @@ class DetectionConfig:
     rider_moto_ioa_thresh: float = 0.05
     gear_rider_ioa_thresh: float = 0.10
     occlusion_conf_thresh: float = 0.10
-    max_riders_per_motorcycle: int = 2
+    max_riders_per_motorcycle: int = 2   # legacy default; per-vehicle overrides live in MAX_RIDERS_PER_VEHICLE
+    # Minimum confidence required on a `no_helmet` detection before flagging
+    # the rider as non-compliant.  Helps reject low-quality false positives.
+    no_helmet_min_conf: float = 0.40
     tracker_key: str = "botsort"
 
 # ── Supported file extensions ──────────────────────────────────────────────────
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".m4v"}
 MODEL_EXTENSIONS = {".pt", ".engine", ".onnx"}
 
-# ── Default model file names (looked up in models/ relative to repo root) ──────
-DEFAULT_MODEL_FILES: Dict[int, str] = {
-    CLASS_MOTORCYCLE: "motorcycle.pt",
-    CLASS_RIDER: "rider.pt",
-    CLASS_HELMET: "helmet.pt",
-    CLASS_FOOTWEAR: "footwear.pt",
-    CLASS_IMPROPER_FOOTWEAR: "improper_footwear.pt",
-}
+# ── Default model file names ─────────────────────────────────────────────────
+# The system now uses ONE unified detector that emits all 7 classes.
+# Every class id maps to the same physical file (``models/unified/best.pt``);
+# the inference engine loads it exactly once.
+UNIFIED_MODEL_PATH: str = os.path.join(_ROOT, "models", "unified", "best.pt")
+DEFAULT_MODEL_FILES: Dict[int, str] = {cid: "unified/best.pt" for cid in TARGET_CLASS_IDS}
 
 # ── Models root directory ──────────────────────────────────────────────────────
 MODELS_DIR = os.path.join(_ROOT, "models")

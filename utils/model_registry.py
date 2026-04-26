@@ -261,49 +261,34 @@ def cleanup_onnx_artifacts() -> int:
 
 def discover_models() -> Dict[int, ModelGroup]:
     """
-    Scan ``models/`` and return ``{class_id: ModelGroup}`` for every
-    known model stem.  Runs legacy-migration automatically.
+    Scan ``models/`` and return ``{class_id: ModelGroup}``.
+
+    The pipeline now uses a single unified ``best.pt`` detector that emits
+    every class.  We therefore look for artifacts under ``models/unified/``
+    and return the same set of variants for every ``class_id`` in
+    ``DEFAULT_MODEL_FILES``.
     """
     migrate_old_structure()
 
+    unified_dir = os.path.join(MODELS_DIR, "unified")
+    variants: List[ModelVariant] = []
+    if os.path.isdir(unified_dir):
+        for entry in sorted(os.listdir(unified_dir)):
+            full = os.path.join(unified_dir, entry)
+            fmt = _detect_format(full)
+            if fmt and not any(v.format == fmt for v in variants):
+                variants.append(_make_variant(full, fmt))
+
+    _order = {"pt": 0, "engine": 1, "onnx": 2, "openvino": 3}
+    variants.sort(key=lambda v: _order.get(v.format, 99))
+
     groups: Dict[int, ModelGroup] = {}
-    for cid, fn in DEFAULT_MODEL_FILES.items():
-        stem = os.path.splitext(fn)[0]
-        mdir = model_dir_for(stem)
-        group = ModelGroup(stem=stem, class_id=cid)
-
-        # Scan per-model directory (primary location)
-        if os.path.isdir(mdir):
-            for entry in sorted(os.listdir(mdir)):
-                full = os.path.join(mdir, entry)
-                fmt = _detect_format(full)
-                if fmt and not group.get_variant(fmt):
-                    group.variants.append(_make_variant(full, fmt))
-
-        # Fallback: flat models/<stem>.pt (if not migrated)
-        flat_pt = os.path.join(MODELS_DIR, fn)
-        if os.path.isfile(flat_pt) and not group.get_variant("pt"):
-            group.variants.append(_make_variant(flat_pt, "pt"))
-
-        # Fallback: old optimized dirs
-        old_gpu = os.path.join(MODELS_DIR, "optimized", "GPU")
-        old_cpu = os.path.join(MODELS_DIR, "optimized", "CPU")
-        for src_dir, ext, fmt in [
-            (old_gpu, ".engine", "engine"),
-            (old_gpu, ".onnx", "onnx"),
-            (old_cpu, ".onnx", "onnx"),
-        ]:
-            p = os.path.join(src_dir, f"{stem}{ext}")
-            if os.path.isfile(p) and not group.get_variant(fmt):
-                group.variants.append(_make_variant(p, fmt))
-        ov = os.path.join(old_cpu, f"{stem}_openvino_model")
-        if os.path.isdir(ov) and not group.get_variant("openvino"):
-            group.variants.append(_make_variant(ov, "openvino"))
-
-        # Sort: pt first, then engine, onnx, openvino
-        _order = {"pt": 0, "engine": 1, "onnx": 2, "openvino": 3}
-        group.variants.sort(key=lambda v: _order.get(v.format, 99))
-
-        groups[cid] = group
-
+    for cid in DEFAULT_MODEL_FILES.keys():
+        # Each class id gets the same variant list (a fresh copy so the GUI
+        # can mutate per-group state independently if it ever needs to).
+        groups[cid] = ModelGroup(
+            stem="best",
+            class_id=cid,
+            variants=list(variants),
+        )
     return groups
