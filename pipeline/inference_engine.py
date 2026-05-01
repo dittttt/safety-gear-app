@@ -29,8 +29,10 @@ from config import (
     CLASS_NAMES,
     CLASS_MOTORCYCLE,
     CLASS_RIDER,
+    CLASS_FOOTWEAR,
     CLASS_CONF_FACTOR,
     CLASS_CONF_MIN,
+    FOOTWEAR_MODEL_PATH,
 )
 from pipeline.state import PipelineState, Detection, DetectionPacket
 from utils.runtime_check import detect as detect_runtime
@@ -92,6 +94,7 @@ class InferenceThread(QtCore.QThread):
     """
 
     UNIFIED_KEY: int = -1   # sentinel key for the single unified model
+    FOOTWEAR_KEY: int = -2  # optional old multimodel footwear detector
 
     status = QtCore.pyqtSignal(str)
     fps_update = QtCore.pyqtSignal(float)
@@ -238,7 +241,7 @@ class InferenceThread(QtCore.QThread):
         return candidates[0] if candidates else None
 
     def _load_models(self) -> None:
-        """(Re)load the single unified detector."""
+        """(Re)load the unified detector and optional footwear override."""
         self._models.clear()
         self._model_paths.clear()
         self._rt = detect_runtime()
@@ -277,6 +280,26 @@ class InferenceThread(QtCore.QThread):
             f"Inference backend: {self._device}"
             f"{' + FP16' if self._fp16 else ''}"
         )
+        self._load_optional_footwear_model()
+
+    def _load_optional_footwear_model(self) -> None:
+        """Load the legacy footwear-only model when present."""
+        path = FOOTWEAR_MODEL_PATH
+        if not self._path_exists(path):
+            return
+        if not self._runtime_supports_path(path):
+            return
+        try:
+            model = self._create_model(path)
+            self._models[self.FOOTWEAR_KEY] = model
+            self._model_paths[self.FOOTWEAR_KEY] = path
+            self.status.emit(
+                f"Footwear override loaded: {os.path.basename(path)}"
+            )
+        except Exception as exc:
+            self.status.emit(
+                f"Failed to load footwear override ({os.path.basename(path)}): {exc}"
+            )
 
     def _predict_kwargs(self, conf: float, iou: float, imgsz: int) -> dict:
         """Backend-aware kwargs for the unified detector."""
@@ -358,6 +381,88 @@ class InferenceThread(QtCore.QThread):
                 out.append(r[0] if isinstance(r, (list, tuple)) and r else r)
             except Exception:
                 out.append(None)
+        return out
+
+    def _footwear_source_class_ids(self) -> Optional[set]:
+        """Return class ids inside the optional footwear model to keep."""
+        model = self._models.get(self.FOOTWEAR_KEY)
+        names = getattr(model, "names", None) if model is not None else None
+        if not isinstance(names, dict) or not names:
+            return None
+        matched = {
+            int(cid)
+            for cid, name in names.items()
+            if str(name).strip().lower().replace(" ", "_") == "footwear"
+        }
+        if matched:
+            return matched
+        if len(names) == 1:
+            return {int(next(iter(names.keys())))}
+        return set()
+
+    def _predict_footwear_override(
+        self,
+        frames: List[np.ndarray],
+        conf: float,
+        iou: float,
+        imgsz: int,
+    ) -> List:
+        """Run the optional footwear-only detector on a list of frames."""
+        model = self._models.get(self.FOOTWEAR_KEY)
+        if model is None:
+            return []
+        path = str(self._model_paths.get(self.FOOTWEAR_KEY, "")).lower()
+        kwargs = {
+            "conf": float(min(CLASS_CONF_MIN.get(CLASS_FOOTWEAR, conf), conf)),
+            "iou": iou,
+            "imgsz": imgsz,
+            "verbose": False,
+        }
+        source_ids = self._footwear_source_class_ids()
+        if source_ids == set():
+            return [None] * len(frames)
+        if source_ids:
+            kwargs["classes"] = sorted(source_ids)
+        if path.endswith(".pt"):
+            kwargs["device"] = self._device
+            kwargs["half"] = self._fp16
+
+        try:
+            results = model.predict(frames, **kwargs)
+            if isinstance(results, (list, tuple)) and len(results) == len(frames):
+                return list(results)
+        except Exception:
+            pass
+        out: List = []
+        for frame in frames:
+            try:
+                r = model.predict(frame, **kwargs)
+                out.append(r[0] if isinstance(r, (list, tuple)) and r else r)
+            except Exception:
+                out.append(None)
+        return out
+
+    def _extract_footwear_override(
+        self,
+        result,
+        min_conf: float,
+    ) -> List[Detection]:
+        """Extract optional footwear model boxes and map them to class id 4."""
+        source_ids = self._footwear_source_class_ids()
+        if source_ids == set():
+            return []
+        raw = self._extract_detections(
+            result,
+            allowed_classes=source_ids if source_ids else None,
+            per_class_min=None,
+        )
+        out: List[Detection] = []
+        for det in raw:
+            if det.confidence < min_conf:
+                continue
+            det.class_id = CLASS_FOOTWEAR
+            det.track_id = None
+            out.append(det)
         return out
 
     def _resolve_tracker_config(self) -> Optional[str]:
@@ -710,6 +815,11 @@ class InferenceThread(QtCore.QThread):
                 per_class_min = cached_per_class_min
                 run_iou_nms = cached_iou_nms_useful
                 iou_overrides = cached_iou_overrides
+                footwear_results = (
+                    self._predict_footwear_override(infer_frames, conf, iou, imgsz)
+                    if CLASS_FOOTWEAR in allowed and self.FOOTWEAR_KEY in self._models
+                    else []
+                )
                 for local_i, result in enumerate(results):
                     if local_i >= len(infer_idxs) or result is None:
                         continue
@@ -726,6 +836,17 @@ class InferenceThread(QtCore.QThread):
                             per_class_min=None,
                         )
                         self._copy_vehicle_rider_track_ids(extracted, tracked)
+                    if local_i < len(footwear_results) and footwear_results[local_i] is not None:
+                        extracted = [
+                            d for d in extracted
+                            if d.class_id != CLASS_FOOTWEAR
+                        ]
+                        extracted.extend(
+                            self._extract_footwear_override(
+                                footwear_results[local_i],
+                                per_class_min.get(CLASS_FOOTWEAR, conf),
+                            )
+                        )
                     if run_iou_nms:
                         extracted = self._apply_per_class_nms(
                             extracted, iou_overrides)

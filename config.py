@@ -127,6 +127,7 @@ MODEL_EXTENSIONS = {".pt", ".engine", ".onnx"}
 # Every class id maps to the same physical file (``models/unified/best.pt``);
 # the inference engine loads it exactly once.
 UNIFIED_MODEL_PATH: str = os.path.join(_ROOT, "models", "unified", "best.pt")
+FOOTWEAR_MODEL_PATH: str = os.path.join(_ROOT, "models", "footwear", "footwear.pt")
 DEFAULT_MODEL_FILES: Dict[int, str] = {cid: "unified/best.pt" for cid in TARGET_CLASS_IDS}
 
 # ── Models root directory ──────────────────────────────────────────────────────
