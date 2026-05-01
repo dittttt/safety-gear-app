@@ -85,13 +85,12 @@ def _silence_clevel_stderr():
 class InferenceThread(QtCore.QThread):
     """Consumer of frames → producer of detections.
 
-    The pipeline now runs a single unified YOLO11s detector that emits all
-    seven safety-compliance classes in one forward pass.  The per-class
-    cascade has been retired — ``self._models`` always holds zero or one
-    entry keyed by ``-1`` (unified model sentinel).
+    Multi-Model-v2 runs one single-class detector per target class.  Each
+    model may emit local YOLO class ``0``; detections are remapped to the
+    app-level class id keyed by ``self._models[cid]``.
     """
 
-    UNIFIED_KEY: int = -1   # sentinel key for the single unified model
+    UNIFIED_KEY: int = -1   # legacy sentinel; not used for model loading here
 
     status = QtCore.pyqtSignal(str)
     fps_update = QtCore.pyqtSignal(float)
@@ -181,20 +180,21 @@ class InferenceThread(QtCore.QThread):
                     pass
         return model
 
-    def _try_rebind_fallback_model(self) -> bool:
-        """Try to rebind the unified model to a sibling artifact."""
-        cur = self._model_paths.get(self.UNIFIED_KEY)
+    def _try_rebind_fallback_model(self, cid: int, reason: str = "") -> bool:
+        """Try to rebind one class model to a sibling compatible artifact."""
+        cur = self._model_paths.get(cid)
         fb = self._fallback_model_path(cur or "")
         if not fb or not self._path_exists(fb):
             return False
         try:
             model = self._create_model(fb)
-            self._models[self.UNIFIED_KEY] = model
-            self._model_paths[self.UNIFIED_KEY] = fb
-            for cid in TARGET_CLASS_IDS:
-                self._state.model_paths[cid] = fb
+            self._models[cid] = model
+            self._model_paths[cid] = fb
+            self._state.model_paths[cid] = fb
+            name = CLASS_NAMES.get(cid, str(cid))
             self.status.emit(
-                f"Unified detector: fallback bound -> {os.path.basename(fb)}"
+                f"{name}: fallback bound -> {os.path.basename(fb)}"
+                + (f" ({reason})" if reason else "")
             )
             return True
         except Exception:
@@ -202,85 +202,61 @@ class InferenceThread(QtCore.QThread):
 
     # ── Model management ───────────────────────────────────────────────────────
 
-    def _resolve_unified_path(self) -> Optional[str]:
-        """Pick the unified model artifact to load.
-
-        Preference order:
-          1. Whatever the GUI / state currently has registered (every cid in
-             ``state.model_paths`` should resolve to the same artifact).
-          2. The configured default at ``models/unified/best.pt`` plus any
-             optimised siblings (.engine / .onnx / OpenVINO IR).
-        """
-        candidates: List[str] = []
-        # 1) State-registered paths (de-duplicated, order-preserving).
-        seen = set()
-        for cid in TARGET_CLASS_IDS:
-            p = self._state.model_paths.get(cid)
-            if p and p not in seen and self._path_exists(p):
-                seen.add(p)
-                candidates.append(p)
-        # 2) Filesystem fallbacks under models/unified/.
-        from config import UNIFIED_MODEL_PATH  # local import to avoid cycles
-        unified_dir = os.path.dirname(UNIFIED_MODEL_PATH)
-        for cand in (
-            os.path.join(unified_dir, "best.engine"),
-            os.path.join(unified_dir, "best_openvino_model"),
-            UNIFIED_MODEL_PATH,
-            os.path.join(unified_dir, "best.onnx"),
-        ):
-            if cand not in seen and self._path_exists(cand):
-                seen.add(cand)
-                candidates.append(cand)
-        # Pick the highest-priority candidate the runtime can support.
-        for path in candidates:
-            if self._runtime_supports_path(path):
-                return path
-        return candidates[0] if candidates else None
-
     def _load_models(self) -> None:
-        """(Re)load the single unified detector."""
+        """(Re)load all configured per-class models."""
         self._models.clear()
         self._model_paths.clear()
         self._rt = detect_runtime()
         self._device = self._resolve_device()
         self._fp16 = self._state.use_fp16() and self._device.startswith("cuda")
-
-        path = self._resolve_unified_path()
-        if not path or not self._path_exists(path):
-            self.status.emit(
-                "No unified detector found — drop best.pt into models/unified/"
-            )
-            return
-        if not self._runtime_supports_path(path):
-            fb = self._fallback_model_path(path)
-            if fb and self._path_exists(fb):
-                self.status.emit(
-                    f"Unified detector: runtime cannot load "
-                    f"{os.path.basename(path)}, using {os.path.basename(fb)}"
-                )
-                path = fb
-
-        tag = os.path.basename(path) if not os.path.isdir(path) else os.path.basename(path.rstrip(os.sep))
-        self.status.emit(f"Loading unified detector: {tag}")
-        try:
-            model = self._create_model(path)
-            self._models[self.UNIFIED_KEY] = model
-            self._model_paths[self.UNIFIED_KEY] = path
-            # Keep state.model_paths consistent so the GUI sees the same file
-            # regardless of which class checkbox the user inspects.
-            for cid in TARGET_CLASS_IDS:
-                self._state.model_paths[cid] = path
-        except Exception as exc:
-            self.status.emit(f"Failed to load unified detector ({tag}): {exc}")
+        for cid in TARGET_CLASS_IDS:
+            path = self._state.model_paths.get(cid)
+            if not self._path_exists(path):
+                continue
+            if not self._runtime_supports_path(path):
+                fb = self._fallback_model_path(path)
+                if fb and self._path_exists(fb):
+                    name = CLASS_NAMES.get(cid, str(cid))
+                    self.status.emit(
+                        f"{name}: runtime cannot load {os.path.basename(path)}, "
+                        f"using {os.path.basename(fb)}"
+                    )
+                    path = fb
+                    self._state.model_paths[cid] = fb
+            name = CLASS_NAMES.get(cid, str(cid))
+            tag = os.path.basename(path) if not os.path.isdir(path) else os.path.basename(path.rstrip(os.sep))
+            self.status.emit(f"Loading {name}: {tag}")
+            try:
+                model = self._create_model(path)
+                self._models[cid] = model
+                self._model_paths[cid] = path
+            except Exception as exc:
+                fb = self._fallback_model_path(path)
+                if fb and self._path_exists(fb):
+                    try:
+                        model = self._create_model(fb)
+                        self._models[cid] = model
+                        self._model_paths[cid] = fb
+                        self._state.model_paths[cid] = fb
+                        self.status.emit(
+                            f"{name}: failed loading {tag}, fallback to {os.path.basename(fb)}"
+                        )
+                        continue
+                    except Exception as fb_exc:
+                        self.status.emit(
+                            f"Failed fallback load {name} ({os.path.basename(fb)}): {fb_exc}"
+                        )
+                self.status.emit(f"Failed to load {name} ({tag}): {exc}")
 
         self.status.emit(
             f"Inference backend: {self._device}"
             f"{' + FP16' if self._fp16 else ''}"
         )
 
-    def _predict_kwargs(self, conf: float, iou: float, imgsz: int) -> dict:
-        """Backend-aware kwargs for the unified detector."""
-        path = str(self._model_paths.get(self.UNIFIED_KEY, "")).lower()
+    def _predict_kwargs_for(self, cid: int, conf: float, iou: float, imgsz: int) -> dict:
+        """Backend-aware kwargs for one per-class detector."""
+        model_path = self._model_paths.get(cid, "")
+        path = str(model_path).lower()
 
         # TensorRT engines bake the input resolution in at export time. Trying
         # to predict at any other ``imgsz`` raises a runtime error and the
@@ -289,10 +265,8 @@ class InferenceThread(QtCore.QThread):
         # inference-size dropdown. Snap to whatever the engine was built
         # for. OpenVINO IR has the same constraint (the static shape lives
         # in the .xml).
-        if path.endswith(".engine") or self._is_openvino_path(
-            self._model_paths.get(self.UNIFIED_KEY, "")
-        ):
-            engine_imgsz = self._native_imgsz()
+        if path.endswith(".engine") or self._is_openvino_path(model_path):
+            engine_imgsz = self._native_imgsz(cid)
             if engine_imgsz and engine_imgsz != imgsz:
                 imgsz = engine_imgsz
 
@@ -301,22 +275,15 @@ class InferenceThread(QtCore.QThread):
             "iou": iou,
             "imgsz": imgsz,
             "verbose": False,
-            # Drop the filler ``tricycle`` class (cid 6) at the Ultralytics
-            # layer so it never reaches NMS, the result objects, or — most
-            # importantly — the BoT-SORT tracker. Otherwise tricycle boxes
-            # consume tracker IDs and a vehicle whose class flickers between
-            # motorcycle and tricycle across frames gets two parallel tracks
-            # instead of one stable motorcycle track.
-            "classes": list(TARGET_CLASS_IDS),
         }
         if path.endswith(".pt"):
             kwargs["device"] = self._device
             kwargs["half"] = self._fp16
         return kwargs
 
-    def _native_imgsz(self) -> Optional[int]:
+    def _native_imgsz(self, cid: int) -> Optional[int]:
         """Best-effort lookup of the model's baked-in input size."""
-        model = self._models.get(self.UNIFIED_KEY)
+        model = self._models.get(cid)
         if model is None:
             return None
         # Ultralytics records the export-time imgsz in ``overrides``.
@@ -331,33 +298,57 @@ class InferenceThread(QtCore.QThread):
         # Fall back to the framework default for our exports.
         return 640
 
-    def _predict_unified(self, frames: List[np.ndarray], kwargs: dict):
-        """Run the unified model once on a list of frames.
-
-        Plain ``predict()`` is the authoritative source for boxes.  BoT-SORT
-        can suppress tiny classes like footwear, so tracking is handled in a
-        separate pass and only used to copy IDs onto motorcycles/riders.
-        """
-        model = self._models.get(self.UNIFIED_KEY)
+    def _predict_with_fallback(
+        self,
+        cid: int,
+        frames: List[np.ndarray],
+        kwargs: dict,
+        allow_batch: bool,
+    ) -> List:
+        """Run one class model, falling back to frame-by-frame if needed."""
+        model = self._models.get(cid)
         if model is None:
             return [None] * len(frames)
-        path = self._model_paths.get(self.UNIFIED_KEY, "")
 
-        allow_batch = not self._is_openvino_path(path)
+        had_error = False
         if allow_batch:
             try:
                 results = model.predict(frames, **kwargs)
                 if isinstance(results, (list, tuple)) and len(results) == len(frames):
                     return list(results)
             except Exception:
-                pass
+                had_error = True
         out: List = []
         for frame in frames:
             try:
                 r = model.predict(frame, **kwargs)
                 out.append(r[0] if isinstance(r, (list, tuple)) and r else r)
             except Exception:
+                had_error = True
                 out.append(None)
+
+        if had_error and out and all(r is None for r in out):
+            if self._try_rebind_fallback_model(cid, reason="runtime predict failure"):
+                retry_path = self._model_paths.get(cid, "")
+                retry_allow_batch = not self._is_openvino_path(retry_path)
+                model = self._models.get(cid)
+                if model is None:
+                    return out
+                if retry_allow_batch:
+                    try:
+                        results = model.predict(frames, **kwargs)
+                        if isinstance(results, (list, tuple)) and len(results) == len(frames):
+                            return list(results)
+                    except Exception:
+                        pass
+                retry_out: List = []
+                for frame in frames:
+                    try:
+                        r = model.predict(frame, **kwargs)
+                        retry_out.append(r[0] if isinstance(r, (list, tuple)) and r else r)
+                    except Exception:
+                        retry_out.append(None)
+                return retry_out
         return out
 
     def _resolve_tracker_config(self) -> Optional[str]:
@@ -387,9 +378,7 @@ class InferenceThread(QtCore.QThread):
         track_kwargs = dict(kwargs)
         track_kwargs.pop("half", None)
         track_kwargs["tracker"] = tracker_cfg
-        # Track only the objects that need stable IDs. Gear classes are tiny
-        # and tracker filtering can suppress them, so they stay predict-only.
-        track_kwargs["classes"] = [CLASS_MOTORCYCLE, CLASS_RIDER]
+        track_kwargs.pop("classes", None)
 
         out: List = []
         for frame in frames:
@@ -473,11 +462,12 @@ class InferenceThread(QtCore.QThread):
         result,
         allowed_classes: Optional[set] = None,
         per_class_min: Optional[Dict[int, float]] = None,
+        force_class_id: Optional[int] = None,
     ) -> List[Detection]:
         """Convert one Ultralytics result into a list of typed Detections.
 
-        ``allowed_classes`` filters by class id (after extraction); pass
-        ``None`` to keep every class the model emitted.
+        ``force_class_id`` remaps every emitted box to the app-level class id
+        for a single-class model.
 
         ``per_class_min`` is a ``{cid: min_conf}`` map applied AFTER the
         model returns. Used to recover small-object recall by running the
@@ -491,11 +481,11 @@ class InferenceThread(QtCore.QThread):
         conf = getattr(boxes, "conf", None)
         cls = getattr(boxes, "cls", None)
         ids = getattr(boxes, "id", None)
-        if xyxy is None or cls is None:
+        if xyxy is None or (cls is None and force_class_id is None):
             return []
 
         xyxy_np = xyxy.cpu().numpy() if hasattr(xyxy, "cpu") else np.asarray(xyxy)
-        cls_np = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls)
+        cls_np = None if cls is None else (cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls))
         conf_np = (
             conf.cpu().numpy() if conf is not None and hasattr(conf, "cpu")
             else (np.asarray(conf) if conf is not None else None)
@@ -509,7 +499,7 @@ class InferenceThread(QtCore.QThread):
 
         dets: List[Detection] = []
         for i in range(len(xyxy_np)):
-            cid = int(cls_np[i])
+            cid = force_class_id if force_class_id is not None else int(cls_np[i])
             if allowed_classes is not None and cid not in allowed_classes:
                 continue
             score = float(conf_np[i]) if conf_np is not None else 0.0
@@ -643,30 +633,6 @@ class InferenceThread(QtCore.QThread):
             if overlay and self._models and infer_idxs:
                 infer_frames = [packets[i].frame for i in infer_idxs]
 
-                # ONE forward pass through the unified detector.  We call
-                # the model with the LOWEST per-class threshold so we can
-                # tighten each class in Python afterwards (recovers small
-                # / underconfident classes like improper_footwear without
-                # blanket-lowering the global slider).
-                model_conf = _floor_inference_conf(conf)
-                kwargs = self._predict_kwargs(model_conf, iou, imgsz)
-                results = self._predict_unified(infer_frames, kwargs)
-                tracker_cfg = self._resolve_tracker_config()
-                tracked_results = (
-                    self._track_frames(
-                        self._models[self.UNIFIED_KEY],
-                        infer_frames,
-                        kwargs,
-                        tracker_cfg,
-                    )
-                    if tracker_cfg and self.UNIFIED_KEY in self._models
-                    else []
-                )
-
-                allowed = {
-                    cid for cid in TARGET_CLASS_IDS
-                    if state.is_model_enabled(cid)
-                }
                 # Per-class min conf + IoU overrides: snapshot only when
                 # the user has actually changed something (version bump)
                 # or when the global conf slider has moved. Otherwise
@@ -698,26 +664,53 @@ class InferenceThread(QtCore.QThread):
                 per_class_min = cached_per_class_min
                 run_iou_nms = cached_iou_nms_useful
                 iou_overrides = cached_iou_overrides
-                for local_i, result in enumerate(results):
-                    if local_i >= len(infer_idxs) or result is None:
+
+                tracker_cfg = self._resolve_tracker_config()
+                for cid in TARGET_CLASS_IDS:
+                    if cid not in self._models or not state.is_model_enabled(cid):
                         continue
-                    pkt_i = infer_idxs[local_i]
-                    extracted = self._extract_detections(
-                        result,
-                        allowed_classes=allowed,
-                        per_class_min=per_class_min,
+                    model_conf = per_class_min.get(cid, _per_class_threshold(cid, conf))
+                    model_iou = iou_overrides.get(cid) if iou_overrides.get(cid) is not None else iou
+                    kwargs = self._predict_kwargs_for(cid, model_conf, model_iou, imgsz)
+                    path = self._model_paths.get(cid, "")
+                    allow_batch = not self._is_openvino_path(path)
+                    results = self._predict_with_fallback(
+                        cid,
+                        infer_frames,
+                        kwargs,
+                        allow_batch=allow_batch,
                     )
-                    if local_i < len(tracked_results) and tracked_results[local_i] is not None:
-                        tracked = self._extract_detections(
-                            tracked_results[local_i],
-                            allowed_classes={CLASS_MOTORCYCLE, CLASS_RIDER},
-                            per_class_min=None,
+
+                    tracked_results = []
+                    if tracker_cfg and cid in (CLASS_MOTORCYCLE, CLASS_RIDER):
+                        model = self._models.get(cid)
+                        if model is not None:
+                            tracked_results = self._track_frames(
+                                model,
+                                infer_frames,
+                                kwargs,
+                                tracker_cfg,
+                            )
+
+                    for local_i, result in enumerate(results):
+                        if local_i >= len(infer_idxs) or result is None:
+                            continue
+                        pkt_i = infer_idxs[local_i]
+                        extracted = self._extract_detections(
+                            result,
+                            per_class_min={cid: model_conf},
+                            force_class_id=cid,
                         )
-                        self._copy_vehicle_rider_track_ids(extracted, tracked)
-                    if run_iou_nms:
-                        extracted = self._apply_per_class_nms(
-                            extracted, iou_overrides)
-                    dets_by_idx[pkt_i].extend(extracted)
+                        if local_i < len(tracked_results) and tracked_results[local_i] is not None:
+                            tracked = self._extract_detections(
+                                tracked_results[local_i],
+                                force_class_id=cid,
+                            )
+                            self._copy_vehicle_rider_track_ids(extracted, tracked)
+                        if run_iou_nms:
+                            extracted = self._apply_per_class_nms(
+                                extracted, iou_overrides)
+                        dets_by_idx[pkt_i].extend(extracted)
 
             for i, packet in enumerate(packets):
                 inferred_this_frame = i in infer_set and overlay and bool(self._models)

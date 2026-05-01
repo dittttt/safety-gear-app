@@ -132,10 +132,9 @@ def _suppress_conflicting_classes(
     """Drop the lower-confidence box when two mutually exclusive classes
     overlap heavily on the same physical object.
 
-    The unified detector occasionally fires both ``helmet`` and
-    ``no_helmet`` (or ``footwear`` and ``improper_footwear``) on the same
-    head/foot — Ultralytics' NMS is per-class so it never dedups across
-    them. The downstream compliance rule resolves the head case by
+    Separate detectors can occasionally fire mutually exclusive classes on
+    the same head/foot. Ultralytics' NMS is per-class so it never dedups
+    across them. The downstream compliance rule resolves the head case by
     ``helmet wins``, which means a true ``no_helmet`` can be silently
     masked by a slightly-higher-confidence false ``helmet``. Removing the
     weaker box at detection time fixes both the visible duplicate boxes

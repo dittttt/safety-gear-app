@@ -12,13 +12,10 @@ from typing import Dict, Tuple
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ── Class IDs ──────────────────────────────────────────────────────────────────
-# The unified ``best.pt`` detector emits SEVEN classes (indices FROZEN to
-# match the trained weights — see utils/unified_constants.MASTER_CLASSES).
-# The seventh class — ``tricycle`` (id 6) — exists purely so the model can
-# disambiguate motorcycles from tricycles during training and is filtered
-# out of the downstream pipeline; it never appears in the UI, stats, or
-# violations.  Compliance logic operates on the six user-facing classes
-# below.
+# Multi-Model-v2 runs five single-class detectors. ``CLASS_NO_HELMET`` is
+# kept as an internal semantic class for optional/future negative-helmet
+# evidence, but it is not part of ``TARGET_CLASS_IDS`` because this branch
+# does not have a separate no_helmet model.
 CLASS_MOTORCYCLE = 0
 CLASS_RIDER = 1
 CLASS_HELMET = 2
@@ -30,7 +27,6 @@ TARGET_CLASS_IDS: Tuple[int, ...] = (
     CLASS_MOTORCYCLE,
     CLASS_RIDER,
     CLASS_HELMET,
-    CLASS_NO_HELMET,
     CLASS_FOOTWEAR,
     CLASS_IMPROPER_FOOTWEAR,
 )
@@ -90,23 +86,11 @@ class DetectionConfig:
 
 
 # ── Per-class confidence tuning ────────────────────────────────────────────────
-# The unified detector is a generalist and tends to be under-confident on
-# small / fine-grained classes (footwear, improper_footwear, helmets at
-# distance). We therefore POST-FILTER detections per class instead of
-# raising the global slider, which would suppress good far-range hits.
-#
-# Pipeline:
-#   1. Run inference at ``conf = min(global_conf, min(_CLASS_CONF_MIN.values()))``
-#      so the model returns everything that *could* be relevant.
-#   2. After extraction, drop any detection whose score is below
-#      ``max(_CLASS_CONF_MIN[cid], global_conf * _CLASS_CONF_FACTOR[cid])``.
-#
-# Tune these knobs per-class without touching the inference loop.
+# Per-class confidence tuning for the five single-class models.
 CLASS_CONF_FACTOR: Dict[int, float] = {
     CLASS_MOTORCYCLE:        1.00,
     CLASS_RIDER:             1.00,
     CLASS_HELMET:            0.80,   # helmets get small at distance
-    CLASS_NO_HELMET:         1.20,   # bias against false positives
     CLASS_FOOTWEAR:          0.70,
     CLASS_IMPROPER_FOOTWEAR: 0.60,   # the big recall lever
 }
@@ -114,7 +98,6 @@ CLASS_CONF_MIN: Dict[int, float] = {
     CLASS_MOTORCYCLE:        0.20,
     CLASS_RIDER:             0.20,
     CLASS_HELMET:            0.15,
-    CLASS_NO_HELMET:         0.30,
     CLASS_FOOTWEAR:          0.12,
     CLASS_IMPROPER_FOOTWEAR: 0.10,
 }
@@ -125,11 +108,14 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MODEL_EXTENSIONS = {".pt", ".engine", ".onnx"}
 
 # ── Default model file names ─────────────────────────────────────────────────
-# The system now uses ONE unified detector that emits all 7 classes.
-# Every class id maps to the same physical file (``models/unified/best.pt``);
-# the inference engine loads it exactly once.
-UNIFIED_MODEL_PATH: str = os.path.join(_ROOT, "models", "unified", "best.pt")
-DEFAULT_MODEL_FILES: Dict[int, str] = {cid: "unified/best.pt" for cid in TARGET_CLASS_IDS}
+# Each class id maps to its own single-class model folder.
+DEFAULT_MODEL_FILES: Dict[int, str] = {
+    CLASS_MOTORCYCLE: "motorcycle/motorcycle.pt",
+    CLASS_RIDER: "rider/rider.pt",
+    CLASS_HELMET: "helmet/helmet.pt",
+    CLASS_FOOTWEAR: "footwear/footwear.pt",
+    CLASS_IMPROPER_FOOTWEAR: "improper_footwear/improper_footwear.pt",
+}
 
 # ── Models root directory ──────────────────────────────────────────────────────
 MODELS_DIR = os.path.join(_ROOT, "models")

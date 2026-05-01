@@ -9,7 +9,14 @@ from typing import Dict, Optional, TYPE_CHECKING
 import cv2, numpy as np, qtawesome as qta
 from PyQt5 import QtCore, QtGui, QtWidgets
 from config import TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, MODEL_EXTENSIONS
-from utils.model_registry import discover_models, _detect_format, _FORMAT_LABEL, cleanup_onnx_artifacts
+from utils.model_registry import (
+    ModelGroup,
+    ModelVariant,
+    discover_models,
+    _detect_format,
+    _FORMAT_LABEL,
+    cleanup_onnx_artifacts,
+)
 from pipeline.state import PipelineState
 from utils.runtime_check import detect as _detect_runtimes
 from utils.camera_devices import discover_camera_devices, open_camera_capture
@@ -52,9 +59,8 @@ _VIOLATION_LABELS = {
     "overload": "OVERLOAD",
 }
 
-# Sentinel key used by the model-picker dictionaries.  The system uses a
-# single unified detector for every class id, so model_combo / browse /
-# convert widgets are stored once under this key instead of once per class.
+# Sentinel key used by the global backend-picker dictionaries.  The UI shows
+# one runtime selector that applies across the per-class model groups.
 _UNIFIED_KEY = -1
 
 # Per-class FontAwesome (fa5s) icon names for the rail pills and any
@@ -1664,7 +1670,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._repos)
 
     def _update_model_format_labels(self) -> None:
-        """No-op kept for legacy callers; sidebar no longer shows per-class\n        format labels under the unified-detector layout."""
+        """No-op kept for legacy callers; sidebar no longer shows per-class\n        format labels under the global-backend layout."""
         return
 
     # ── overlay positioning ───────────────────────────────────────────────
@@ -2154,26 +2160,26 @@ class MainWindow(QtWidgets.QMainWindow):
         combo = self._mcombo.get(_UNIFIED_KEY)
         if combo is not None and combo.count() > 0:
             combo.setCurrentIndex(0)
-        self._set_status("Unified detector set to Auto")
+        self._set_status("Model backend set to Auto")
 
     def _set_all_models_format(self, fmt: str, label: str) -> None:
-        """Set the unified detector combobox to the requested runtime format."""
+        """Set the global model combobox to the requested runtime format."""
         combo = self._mcombo.get(_UNIFIED_KEY)
         if combo is None:
-            self._set_status("No unified detector picker available")
+            self._set_status("No model backend picker available")
             return
         target_idx = -1
         for idx in range(combo.count()):
             data = combo.itemData(idx) or {}
-            if data.get("type") in ("variant", "custom") and data.get("format") == fmt:
+            if data.get("type") == "format" and data.get("format") == fmt:
                 target_idx = idx
                 break
         if target_idx >= 0:
             if combo.currentIndex() != target_idx:
                 combo.setCurrentIndex(target_idx)
-            self._set_status(f"Unified detector set to {label}")
+            self._set_status(f"Model backend set to {label}")
         else:
-            self._set_status(f"{label} format not available for unified detector")
+            self._set_status(f"{label} format not available for loaded models")
 
     def _step_forward(self) -> None:
         path, _cam = self._state.get_source()
@@ -2190,12 +2196,14 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._model_groups = discover_models()
-        # Single unified picker — populate it once and report whether the
-        # detector was found.
+        # Single runtime picker — it selects a backend format across all
+        # five per-class model groups.
         self._populate_model_combo(_UNIFIED_KEY)
-        probe_cid = next(iter(TARGET_CLASS_IDS))
-        probe = self._model_groups.get(probe_cid)
-        loaded = ["Unified Detector"] if (probe and probe.variants) else []
+        loaded = [
+            CLASS_NAMES.get(cid, str(cid))
+            for cid, group in self._model_groups.items()
+            if group.variants
+        ]
         use_cuda = self._has_cuda()
         default_imgsz = 640 if use_cuda else 480
         default_stride = 1 if use_cuda else 2
@@ -2257,32 +2265,49 @@ class MainWindow(QtWidgets.QMainWindow):
             return "cuda"
         return "cpu"
 
-    def _mirror_unified_path(self, path: Optional[str]) -> None:
-        """Set ``state.model_paths[cid] = path`` for every target class id.
+    def _infer_class_from_model_path(self, path: str) -> Optional[int]:
+        """Infer the logical class id from a browsed model path."""
+        parts = {p.lower() for p in os.path.normpath(path).split(os.sep)}
+        base = os.path.splitext(os.path.basename(path.rstrip(os.sep)))[0].lower()
+        for cid, group in self._model_groups.items():
+            stem = group.stem.lower()
+            if stem in parts or base == stem or base.startswith(stem):
+                return cid
+        return None
 
-        With a single unified detector, every class id resolves to the
-        same physical model file.
-        """
-        for tcid in TARGET_CLASS_IDS:
-            self._state.model_paths[tcid] = path
+    def _apply_model_format(self, fmt: str) -> bool:
+        """Select one backend format across all available per-class models."""
+        any_selected = False
+        device = self._get_effective_device()
+        for cid in TARGET_CLASS_IDS:
+            group = self._model_groups.get(cid)
+            variant = group.get_variant(fmt) if group else None
+            if variant is None and group:
+                variant = group.best_for_device(device)
+            self._state.model_paths[cid] = variant.path if variant else None
+            any_selected = any_selected or bool(variant)
+        return any_selected
 
     def _populate_model_combo(self, cid: int = _UNIFIED_KEY) -> None:
-        """Fill the unified model combobox with Auto + discovered variants."""
+        """Fill the global runtime combobox with Auto + discovered formats."""
         combo = self._mcombo[_UNIFIED_KEY]
         combo.blockSignals(True)
         combo.clear()
 
         combo.addItem("Auto (best for device)", {"type": "auto"})
 
-        # All groups share the same variant list under the unified scheme;
-        # any cid works as a probe.
-        probe_cid = next(iter(TARGET_CLASS_IDS))
-        group = self._model_groups.get(probe_cid)
-        if group and group.variants:
-            for v in group.variants:
-                combo.addItem(v.display_name, {
-                    "type": "variant", "path": v.path, "format": v.format,
-                })
+        formats = []
+        seen = set()
+        order = {"engine": 0, "openvino": 1, "pt": 2, "onnx": 3}
+        for group in self._model_groups.values():
+            for variant in group.variants:
+                if variant.format not in seen:
+                    seen.add(variant.format)
+                    formats.append(variant.format)
+        for fmt in sorted(formats, key=lambda f: order.get(f, 99)):
+            combo.addItem(_FORMAT_LABEL.get(fmt, fmt), {
+                "type": "format", "format": fmt,
+            })
 
         combo.setCurrentIndex(0)
         combo.blockSignals(False)
@@ -2292,24 +2317,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _resolve_auto_model(self, cid: int = _UNIFIED_KEY) -> None:
         """Resolve the 'Auto' selection to the best variant for the device."""
-        probe_cid = next(iter(TARGET_CLASS_IDS))
-        group = self._model_groups.get(probe_cid)
         combo = self._mcombo[_UNIFIED_KEY]
-        if not group or not group.variants:
-            self._mirror_unified_path(None)
+        if not any(group.variants for group in self._model_groups.values()):
+            for tcid in TARGET_CLASS_IDS:
+                self._state.model_paths[tcid] = None
             combo.setToolTip("No models found")
             return
         device = self._get_effective_device()
-        variant = group.best_for_device(device)
-        if variant:
-            self._mirror_unified_path(variant.path)
-            combo.setToolTip(f"Using: {variant.display_name}")
+        lines = []
+        for tcid in TARGET_CLASS_IDS:
+            group = self._model_groups.get(tcid)
+            variant = group.best_for_device(device) if group else None
+            self._state.model_paths[tcid] = variant.path if variant else None
+            if variant:
+                lines.append(f"{CLASS_NAMES.get(tcid, tcid)}: {variant.display_name}")
+        if lines:
+            combo.setToolTip("\n".join(lines))
         else:
-            self._mirror_unified_path(None)
             combo.setToolTip("No compatible model for current device")
 
     def _on_model_combo_changed(self, cid: int = _UNIFIED_KEY) -> None:
-        """Handle unified model combobox selection change."""
+        """Handle global runtime combobox selection change."""
         combo = self._mcombo[_UNIFIED_KEY]
         data = combo.currentData()
         if not data:
@@ -2319,20 +2347,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if kind == "auto":
             self._resolve_auto_model(_UNIFIED_KEY)
-        elif kind in ("variant", "custom"):
-            self._mirror_unified_path(data["path"])
-            combo.setToolTip(data["path"])
+        elif kind == "format":
+            fmt = data.get("format")
+            if fmt and self._apply_model_format(fmt):
+                combo.setToolTip(f"Using {_FORMAT_LABEL.get(fmt, fmt)} where available")
+            else:
+                combo.setToolTip("No compatible models for selected format")
 
         self._prev_combo_idx[_UNIFIED_KEY] = combo.currentIndex()
         self._update_convert_buttons()
         self._update_model_format_labels()
 
     def _on_browse_model(self, cid: int = _UNIFIED_KEY) -> None:
-        """Open a file/folder dialog for browsing the unified model."""
+        """Open a file/folder dialog for browsing one per-class model."""
         from utils.model_registry import MODELS_DIR
         start_dir = MODELS_DIR if os.path.isdir(MODELS_DIR) else ""
         p, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Unified Detector", start_dir,
+            self, "Load Class Model", start_dir,
             "Model Files (*.pt *.engine *.onnx);;OpenVINO (*.xml);;All (*)")
         if p:
             # If user picked an .xml inside an openvino dir, use the parent dir
@@ -2344,46 +2375,54 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
     def _add_custom_model(self, cid: int, path: str) -> None:
-        """Add a user-browsed model to the unified combobox and select it."""
+        """Register a browsed model path for its inferred class."""
         fmt = _detect_format(path)
         if not fmt:
             QtWidgets.QMessageBox.warning(
                 self, "Unsupported Format",
                 f"Cannot detect model format:\n{path}")
             return
-        label = f"{os.path.basename(path)}  ({_FORMAT_LABEL.get(fmt, fmt)})"
-        combo = self._mcombo[_UNIFIED_KEY]
-        combo.blockSignals(True)
-        insert_idx = combo.count()
-        combo.insertItem(insert_idx, label, {
-            "type": "custom", "path": path, "format": fmt,
-        })
-        combo.setCurrentIndex(insert_idx)
-        combo.blockSignals(False)
-        self._mirror_unified_path(path)
-        combo.setToolTip(path)
-        self._prev_combo_idx[_UNIFIED_KEY] = insert_idx
+        target_cid = cid if cid in TARGET_CLASS_IDS else self._infer_class_from_model_path(path)
+        if target_cid is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Unknown Model Class",
+                "Pick a model from one of the class folders: motorcycle, rider, helmet, footwear, or improper_footwear.")
+            return
+        group = self._model_groups.get(target_cid)
+        if group is None:
+            group = ModelGroup(
+                stem=os.path.splitext(os.path.basename(path))[0],
+                class_id=target_cid,
+                variants=[],
+            )
+            self._model_groups[target_cid] = group
+        label = f"{os.path.basename(path.rstrip(os.sep))}  ({_FORMAT_LABEL.get(fmt, fmt)})"
+        group.variants = [v for v in group.variants if v.format != fmt]
+        group.variants.append(ModelVariant(path=path, format=fmt, display_name=label))
+        self._state.model_paths[target_cid] = path
+        self._populate_model_combo(_UNIFIED_KEY)
+        self._set_status(f"Loaded {CLASS_NAMES.get(target_cid, target_cid)} model")
         self._update_convert_buttons()
         self._update_model_format_labels()
 
     def _refresh_model_combos(self) -> None:
-        """Re-discover models and repopulate the unified combobox."""
+        """Re-discover models and repopulate the global runtime combobox."""
         self._model_groups = discover_models()
         combo = self._mcombo[_UNIFIED_KEY]
         old_data = combo.currentData() or {}
         was_auto = old_data.get("type") == "auto"
-        old_path = old_data.get("path")
+        old_fmt = old_data.get("format")
 
         self._populate_model_combo(_UNIFIED_KEY)
 
-        if not was_auto and old_path:
+        if not was_auto and old_fmt:
             for i in range(combo.count()):
                 d = combo.itemData(i) or {}
-                if d.get("path") == old_path:
+                if d.get("format") == old_fmt:
                     combo.blockSignals(True)
                     combo.setCurrentIndex(i)
                     combo.blockSignals(False)
-                    self._mirror_unified_path(old_path)
+                    self._apply_model_format(old_fmt)
                     self._prev_combo_idx[_UNIFIED_KEY] = i
                     break
         self._update_model_format_labels()
@@ -2701,7 +2740,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _backend_label_for(path: str) -> str:
-        """Map a unified-detector artifact path to a short backend tag.
+        """Map a model artifact path to a short backend tag.
 
         Always-visible in the status bar so the user can tell at a glance
         which runtime is actually executing inference (PyTorch vs the
@@ -2725,13 +2764,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return os.path.splitext(os.path.basename(path))[1].lstrip(".").upper() or "?"
 
     def _current_backend_label(self) -> str:
-        # Every cid in state.model_paths points at the same unified file;
-        # grab whatever the first registered slot has.
+        labels = set()
         for cid in TARGET_CLASS_IDS:
             p = self._state.model_paths.get(cid)
             if p:
-                return self._backend_label_for(p)
-        return "\u2014"
+                labels.add(self._backend_label_for(p))
+        if not labels:
+            return "\u2014"
+        return next(iter(labels)) if len(labels) == 1 else "Mixed"
 
     def _on_stats(self, s: dict) -> None:
         parts = [
@@ -2930,27 +2970,28 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._get_effective_device()
 
     def _update_convert_buttons(self) -> None:
-        """Show / hide the unified convert button and the Optimize-All button."""
+        """Show / hide conversion controls for per-class model groups."""
         rt = _detect_runtimes()
         has_cuda = self._has_cuda()
 
-        probe_cid = next(iter(TARGET_CLASS_IDS))
-        group = self._model_groups.get(probe_cid)
         btn = self._mconv[_UNIFIED_KEY]
+        groups = [
+            self._model_groups.get(cid)
+            for cid in TARGET_CLASS_IDS
+            if self._model_groups.get(cid) is not None
+        ]
+        pt_groups = [group for group in groups if group.has_pt]
 
-        if not group or not group.has_pt:
+        if not pt_groups:
             btn.setVisible(False)
             self.btnOptimizeAll.setVisible(False)
             return
 
-        gpu_done = (
-            (not has_cuda)
-            or (rt.best_gpu_format == "pt")
-            or bool(group.get_variant(rt.best_gpu_format))
+        gpu_done = (not has_cuda) or (rt.best_gpu_format == "pt") or all(
+            bool(group.get_variant(rt.best_gpu_format)) for group in pt_groups
         )
-        cpu_done = (
-            (rt.best_cpu_format == "pt")
-            or bool(group.get_variant(rt.best_cpu_format))
+        cpu_done = (rt.best_cpu_format == "pt") or all(
+            bool(group.get_variant(rt.best_cpu_format)) for group in pt_groups
         )
         all_done = gpu_done and cpu_done
         no_runtime = (rt.best_gpu_format == "pt" and rt.best_cpu_format == "pt")
@@ -2993,19 +3034,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return pt_path  # "pt" or unknown — already exists
 
     def _build_convert_jobs(self, cids=None):
-        """Return ConvertJob tuples for the unified detector (GPU + CPU).
+        """Return ConvertJob tuples for per-class detectors.
 
         Skips any device whose output file/directory already exists on disk.
         """
         from utils.runtime_check import best_format as _best_format
 
-        probe_cid = next(iter(TARGET_CLASS_IDS))
-        group = self._model_groups.get(probe_cid)
-        if not group or not group.has_pt:
-            return []
-        pt_variant = group.get_variant("pt")
-        if not pt_variant:
-            return []
+        target_cids = list(cids or TARGET_CLASS_IDS)
 
         imgsz = self._state.get_imgsz()
         has_cuda = self._has_cuda()
@@ -3017,24 +3052,31 @@ class MainWindow(QtWidgets.QMainWindow):
             candidates.append(("cuda", imgsz, half))
         candidates.append(("cpu", imgsz, half))
 
-        for device_key, _imgsz, _half in candidates:
-            fmt = _best_format(device_key)
-            if fmt == "pt":
-                continue  # no useful conversion available
-            out_path = self._expected_output_path(pt_variant.path, fmt)
-            if os.path.isfile(out_path) or os.path.isdir(out_path):
-                self._log(
-                    f"Skipping {device_key.upper()} optimisation — "
-                    f"{os.path.basename(out_path)} already exists"
-                )
+        for cid in target_cids:
+            group = self._model_groups.get(cid)
+            if not group or not group.has_pt:
                 continue
-            jobs.append((_UNIFIED_KEY, pt_variant.path, device_key, _imgsz, _half))
+            pt_variant = group.get_variant("pt")
+            if not pt_variant:
+                continue
+            for device_key, _imgsz, _half in candidates:
+                fmt = _best_format(device_key)
+                if fmt == "pt":
+                    continue  # no useful conversion available
+                out_path = self._expected_output_path(pt_variant.path, fmt)
+                if os.path.isfile(out_path) or os.path.isdir(out_path):
+                    self._log(
+                        f"Skipping {CLASS_NAMES.get(cid, cid)} {device_key.upper()} optimisation — "
+                        f"{os.path.basename(out_path)} already exists"
+                    )
+                    continue
+                jobs.append((cid, pt_variant.path, device_key, _imgsz, _half))
 
         return jobs
 
     def _on_convert_model(self, cid: int = _UNIFIED_KEY) -> None:
-        """Start conversion of the unified detector (GPU + CPU)."""
-        jobs = self._build_convert_jobs()
+        """Start conversion of per-class detectors (GPU + CPU)."""
+        jobs = self._build_convert_jobs(None if cid == _UNIFIED_KEY else [cid])
         if not jobs:
             self._set_status("Nothing to convert (already optimised or no .pt available)")
             return
@@ -3047,7 +3089,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_conversion(jobs)
 
     def _on_convert_all(self) -> None:
-        """Alias for _on_convert_model under the unified-detector layout."""
+        """Convert all per-class detectors with available .pt files."""
         self._on_convert_model(_UNIFIED_KEY)
 
     def _start_conversion(self, jobs) -> None:
@@ -3112,7 +3154,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if success:
             self._set_status(
-                f"{CLASS_NAMES.get(cid, 'Unified Detector')} → {fmt_name} ✓  ({os.path.basename(result)})")
+                f"{CLASS_NAMES.get(cid, 'Class Model')} → {fmt_name} ✓  ({os.path.basename(result)})")
             btn = self._mconv.get(cid)
             if btn:
                 btn.setIcon(_fa("check-circle", "#4CAF50", int(11 * _S)))
@@ -3120,7 +3162,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn.setEnabled(False)
         else:
             self._set_status(
-                f"{CLASS_NAMES.get(cid, 'Unified Detector')} conversion failed: {result.splitlines()[0]}")
+                f"{CLASS_NAMES.get(cid, 'Class Model')} conversion failed: {result.splitlines()[0]}")
             btn = self._mconv.get(cid)
             if btn:
                 btn.setIcon(_fa("exclamation-triangle", "#f44336", int(11 * _S)))

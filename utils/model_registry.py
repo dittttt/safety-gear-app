@@ -14,10 +14,7 @@ Canonical per-model layout::
             motorcycle_openvino_model/
         helmet/
             helmet.pt
-            …
-
-Legacy flat + optimized/{CPU,GPU} layout is auto-migrated on first
-call to :func:`discover_models`.
+            ...
 """
 
 from __future__ import annotations
@@ -30,6 +27,11 @@ from config import DEFAULT_MODEL_FILES
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(_ROOT, "models")
+
+_STEM_TO_CID: Dict[str, int] = {
+    os.path.splitext(os.path.basename(path))[0]: cid
+    for cid, path in DEFAULT_MODEL_FILES.items()
+}
 
 _FORMAT_LABEL: Dict[str, str] = {
     "pt": "PyTorch",
@@ -174,32 +176,35 @@ def cleanup_onnx_artifacts() -> int:
 
 def discover_models() -> Dict[int, ModelGroup]:
     """
-    Return ``{class_id: ModelGroup}`` by scanning ``models/unified/``.
+    Return ``{class_id: ModelGroup}`` by scanning per-class model folders.
 
-    The pipeline uses a single unified ``best.pt`` detector that emits
-    every class, so every ``class_id`` in ``DEFAULT_MODEL_FILES`` is
-    backed by the same set of variants (``.pt`` / ``.engine`` /
-    ``.onnx`` / OpenVINO directory).
+    Multi-Model-v2 expects five folders under ``models/``:
+    ``motorcycle/``, ``rider/``, ``helmet/``, ``footwear/``, and
+    ``improper_footwear/``. Each folder may contain ``.pt``, ``.engine``,
+    ``.onnx``, or an OpenVINO IR directory.
     """
-    unified_dir = os.path.join(MODELS_DIR, "unified")
-    variants: List[ModelVariant] = []
-    if os.path.isdir(unified_dir):
-        for entry in sorted(os.listdir(unified_dir)):
-            full = os.path.join(unified_dir, entry)
-            fmt = _detect_format(full)
-            if fmt and not any(v.format == fmt for v in variants):
-                variants.append(_make_variant(full, fmt))
-
     _order = {"pt": 0, "engine": 1, "onnx": 2, "openvino": 3}
-    variants.sort(key=lambda v: _order.get(v.format, 99))
-
     groups: Dict[int, ModelGroup] = {}
-    for cid in DEFAULT_MODEL_FILES.keys():
-        # Each class id gets the same variant list (a fresh copy so the GUI
-        # can mutate per-group state independently if it ever needs to).
+
+    for cid, rel_path in DEFAULT_MODEL_FILES.items():
+        stem = os.path.splitext(os.path.basename(rel_path))[0]
+        model_dir = os.path.join(MODELS_DIR, stem)
+        variants: List[ModelVariant] = []
+        if os.path.isdir(model_dir):
+            for entry in sorted(os.listdir(model_dir)):
+                full = os.path.join(model_dir, entry)
+                fmt = _detect_format(full)
+                if fmt and not any(v.format == fmt for v in variants):
+                    variants.append(_make_variant(full, fmt))
+        # Also support a direct path from DEFAULT_MODEL_FILES if a .pt exists.
+        direct = os.path.join(MODELS_DIR, rel_path)
+        fmt = _detect_format(direct) if _exists(direct) else None
+        if fmt and not any(v.format == fmt for v in variants):
+            variants.append(_make_variant(direct, fmt))
+        variants.sort(key=lambda v: _order.get(v.format, 99))
         groups[cid] = ModelGroup(
-            stem="best",
+            stem=stem,
             class_id=cid,
-            variants=list(variants),
+            variants=variants,
         )
     return groups
