@@ -83,6 +83,90 @@ def _best_parent_index(
     return None
 
 
+def _nearest_containing_parent(
+    child: Tuple[int, int, int, int],
+    parents: List[Tuple[int, int, int, int]],
+) -> Optional[int]:
+    """Return parent index whose box contains the child centre AND whose
+    own centre is closest to the child centre. Deterministic tie-break by
+    smaller index.
+
+    Used as a fallback when IoA association fails for tiny gear boxes —
+    avoids the previous "first containing rider wins" bug where two
+    side-by-side riders made gear attribution depend on detection order.
+    """
+    if not parents:
+        return None
+    cx, cy = _box_center(child)
+    best_idx = -1
+    best_dist_sq = float("inf")
+    for idx, parent_box in enumerate(parents):
+        if not _point_in_box((cx, cy), parent_box):
+            continue
+        px, py = _box_center(parent_box)
+        dx = cx - px
+        dy = cy - py
+        dist_sq = dx * dx + dy * dy
+        if dist_sq < best_dist_sq:
+            best_dist_sq = dist_sq
+            best_idx = idx
+    return best_idx if best_idx >= 0 else None
+
+
+def _box_iou(
+    a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]
+) -> float:
+    """Standard IoU of two boxes."""
+    inter = _intersection_area(a, b)
+    if inter <= 0:
+        return 0.0
+    union = _box_area(*a) + _box_area(*b) - inter
+    return inter / float(union) if union > 0 else 0.0
+
+
+def _suppress_conflicting_classes(
+    dets: List["Detection"],
+    pair: Tuple[int, int],
+    iou_thresh: float = 0.45,
+) -> List["Detection"]:
+    """Drop the lower-confidence box when two mutually exclusive classes
+    overlap heavily on the same physical object.
+
+    The unified detector occasionally fires both ``helmet`` and
+    ``no_helmet`` (or ``footwear`` and ``improper_footwear``) on the same
+    head/foot — Ultralytics' NMS is per-class so it never dedups across
+    them. The downstream compliance rule resolves the head case by
+    ``helmet wins``, which means a true ``no_helmet`` can be silently
+    masked by a slightly-higher-confidence false ``helmet``. Removing the
+    weaker box at detection time fixes both the visible duplicate boxes
+    and the masking bug.
+    """
+    cid_a, cid_b = pair
+    a_dets = [d for d in dets if d.class_id == cid_a]
+    b_dets = [d for d in dets if d.class_id == cid_b]
+    if not a_dets or not b_dets:
+        return dets
+    drop = set()
+    for da in a_dets:
+        if id(da) in drop:
+            continue
+        abox = (da.x1, da.y1, da.x2, da.y2)
+        for db in b_dets:
+            if id(db) in drop:
+                continue
+            bbox = (db.x1, db.y1, db.x2, db.y2)
+            if _box_iou(abox, bbox) >= iou_thresh:
+                # Drop the lower-confidence detection.
+                if da.confidence >= db.confidence:
+                    drop.add(id(db))
+                else:
+                    drop.add(id(da))
+                    break  # da is gone — move on
+    if not drop:
+        return dets
+    return [d for d in dets if id(d) not in drop]
+
+
 # ── Thread ─────────────────────────────────────────────────────────────────────
 
 class TrackerLogicThread(QtCore.QThread):
@@ -135,6 +219,17 @@ class TrackerLogicThread(QtCore.QThread):
             dets = packet.detections
             cfg = state.detection_config
             occlusion_thresh = cfg.occlusion_conf_thresh
+
+            # Cross-class duplicate suppression (ONCE, before any rule
+            # operates on the lists).  Mutually-exclusive classes that
+            # overlap heavily on the same physical object would otherwise
+            # both reach the rule layer and the helmet/footwear-positive
+            # rule would mask true violations.
+            if dets:
+                dets = _suppress_conflicting_classes(
+                    dets, (CLASS_HELMET, CLASS_NO_HELMET))
+                dets = _suppress_conflicting_classes(
+                    dets, (CLASS_FOOTWEAR, CLASS_IMPROPER_FOOTWEAR))
 
             if state.is_overlay_enabled() and not packet.detections_fresh:
                 annotated = frame
@@ -208,64 +303,45 @@ class TrackerLogicThread(QtCore.QThread):
             matched_footwear: List[Detection] = []
             matched_improper_fw: List[Detection] = []
 
-            for h in helmets:
-                hbox = (h.x1, h.y1, h.x2, h.y2)
-                best_ri = _best_parent_index(hbox, rboxes, cfg.gear_rider_ioa_thresh)
-                if best_ri is None and rboxes:
-                    hc = _box_center(hbox)
-                    for ri, rbox in enumerate(rboxes):
-                        if _point_in_box(hc, rbox):
-                            best_ri = ri
-                            break
-                if best_ri is not None:
-                    rider_gear[best_ri]["helmet"] = True
-                    matched_helmets.append(h)
+            def _attach_to_rider(
+                gear_dets: List[Detection],
+                gear_key: str,
+                sink: List[Detection],
+                min_conf: float = 0.0,
+            ) -> None:
+                """Associate gear detections to their best-matching rider.
+
+                Tries IoA first (best overlap above threshold); falls back
+                to a centre-point-in-rider-box test for tiny gear boxes
+                that overlap poorly but are clearly inside the rider.
+                """
+                gate = cfg.gear_rider_ioa_thresh
+                for d in gear_dets:
+                    if min_conf and d.confidence < min_conf:
+                        continue
+                    box = (d.x1, d.y1, d.x2, d.y2)
+                    best_ri = _best_parent_index(box, rboxes, gate)
+                    # Deterministic fallback: nearest rider whose box
+                    # actually contains the gear centre. Replaces the
+                    # previous "first containing rider wins" loop that
+                    # mis-attributed gear on side-by-side riders.
+                    if best_ri is None:
+                        best_ri = _nearest_containing_parent(box, rboxes)
+                    if best_ri is not None:
+                        rider_gear[best_ri][gear_key] = True
+                        sink.append(d)
+
+            _attach_to_rider(helmets, "helmet", matched_helmets)
 
             # `no_helmet` is a direct violation class.  Apply a higher conf
             # gate (`no_helmet_min_conf`) than the generic occlusion thresh
             # because false positives here translate directly into reported
             # violations / DB rows.
             no_helmet_min = max(occlusion_thresh, getattr(cfg, "no_helmet_min_conf", 0.40))
-            for nh in no_helmets:
-                if nh.confidence < no_helmet_min:
-                    continue
-                nhbox = (nh.x1, nh.y1, nh.x2, nh.y2)
-                best_ri = _best_parent_index(nhbox, rboxes, cfg.gear_rider_ioa_thresh)
-                if best_ri is None and rboxes:
-                    nhc = _box_center(nhbox)
-                    for ri, rbox in enumerate(rboxes):
-                        if _point_in_box(nhc, rbox):
-                            best_ri = ri
-                            break
-                if best_ri is not None:
-                    rider_gear[best_ri]["no_helmet"] = True
-                    matched_no_helmets.append(nh)
+            _attach_to_rider(no_helmets, "no_helmet", matched_no_helmets, min_conf=no_helmet_min)
 
-            for fw in footwear:
-                fbox = (fw.x1, fw.y1, fw.x2, fw.y2)
-                best_ri = _best_parent_index(fbox, rboxes, cfg.gear_rider_ioa_thresh)
-                if best_ri is None and rboxes:
-                    fc = _box_center(fbox)
-                    for ri, rbox in enumerate(rboxes):
-                        if _point_in_box(fc, rbox):
-                            best_ri = ri
-                            break
-                if best_ri is not None:
-                    rider_gear[best_ri]["footwear_ok"] = True
-                    matched_footwear.append(fw)
-
-            for ifw in improper_fw:
-                ifbox = (ifw.x1, ifw.y1, ifw.x2, ifw.y2)
-                best_ri = _best_parent_index(ifbox, rboxes, cfg.gear_rider_ioa_thresh)
-                if best_ri is None and rboxes:
-                    ic = _box_center(ifbox)
-                    for ri, rbox in enumerate(rboxes):
-                        if _point_in_box(ic, rbox):
-                            best_ri = ri
-                            break
-                if best_ri is not None:
-                    rider_gear[best_ri]["improper_fw"] = True
-                    matched_improper_fw.append(ifw)
+            _attach_to_rider(footwear, "footwear_ok", matched_footwear)
+            _attach_to_rider(improper_fw, "improper_fw", matched_improper_fw)
 
             # ── Check OVERLOAD ─────────────────────────────────────────────
             # Motorcycle limit (LTO MC No. 2014-001): 2 riders max.
@@ -419,8 +495,13 @@ class TrackerLogicThread(QtCore.QThread):
                         moto_icons,
                     )
 
-                # Riders — box always uses the rider class colour. Compliance
-                # is communicated through icon badges beside the label.
+                # Riders — box always uses the rider class colour.
+                # Compliance is shown as a per-segment coloured status line
+                # drawn directly below the bounding box:
+                #     Helmet ✓ | Footwear ?
+                # Each word is coloured independently (green = compliant,
+                # red = violation, yellow = unknown) so the user can read
+                # status at a glance without decoding tiny icons.
                 base_rider_color = class_colors.get(
                     CLASS_RIDER,
                     CLASS_COLORS_BGR.get(CLASS_RIDER, (255, 255, 255)),
@@ -436,13 +517,7 @@ class TrackerLogicThread(QtCore.QThread):
                         ok=gear.get("footwear_ok") and not gear.get("improper_fw"),
                         bad=gear.get("improper_fw"),
                     )
-
-                    rider_icons = [
-                        ("helmet", helmet_status),
-                        ("shoe",   fw_status),
-                    ]
-                    if id(rider) in overloaded_rider_ids:
-                        rider_icons.append(("overload", "bad"))
+                    on_overloaded = id(rider) in overloaded_rider_ids
 
                     cv2.rectangle(
                         annotated,
@@ -451,21 +526,34 @@ class TrackerLogicThread(QtCore.QThread):
                         base_rider_color, 2,
                     )
                     tid_str = f" ID:{rider.track_id}" if rider.track_id is not None else ""
-                    _draw_label_with_icons(
+                    _draw_label(
                         annotated,
                         f"Rider{tid_str} {rider.confidence:.2f}",
-                        rider.x1, rider.y1,
-                        base_rider_color,
-                        rider_icons,
+                        rider.x1, rider.y1, base_rider_color,
                     )
 
-                # Gear boxes: only draw associated ones
-                gear_dets = (
-                    matched_helmets
-                    + matched_no_helmets
-                    + matched_footwear
-                    + matched_improper_fw
-                )
+                    segments: List[Tuple[str, str]] = [
+                        (_status_label("Helmet",   helmet_status), helmet_status),
+                        (_status_label("Footwear", fw_status),     fw_status),
+                    ]
+                    if on_overloaded:
+                        segments.append(("Overload", _STATUS_BAD))
+
+                    _draw_status_line(
+                        annotated,
+                        rider.x1,
+                        rider.y2 + 4,
+                        segments,
+                    )
+
+                # Gear boxes: draw every valid gear detection. Compliance
+                # stats still use the matched_* lists above, but the overlay
+                # should not hide a detected shoe/helmet just because rider
+                # association was imperfect in that frame.
+                visible_no_helmets = [
+                    d for d in no_helmets if d.confidence >= no_helmet_min
+                ]
+                gear_dets = helmets + visible_no_helmets + footwear + improper_fw
                 for d in gear_dets:
                     color = class_colors.get(d.class_id, CLASS_COLORS_BGR.get(d.class_id, (255, 255, 255)))
                     cv2.rectangle(annotated, (d.x1, d.y1), (d.x2, d.y2), color, 2)
@@ -525,6 +613,74 @@ def _gear_status(ok: bool, bad: bool) -> str:
     if bad:
         return _STATUS_BAD
     return _STATUS_UNKNOWN
+
+
+def _status_label(name: str, status: str) -> str:
+    """Build the per-segment label, e.g. 'Helmet', 'Helmet ✗', 'Helmet ?'."""
+    suffix = {
+        _STATUS_OK:      "",
+        _STATUS_BAD:     " X",
+        _STATUS_UNKNOWN: " ?",
+    }.get(status, "")
+    return f"{name}{suffix}"
+
+
+def _draw_status_line(
+    img: np.ndarray,
+    x: int,
+    y: int,
+    segments: List[Tuple[str, str]],
+    font_scale: float = 0.55,
+    thickness: int = 2,
+) -> None:
+    """Draw ``Helmet | Footwear | …`` below a rider with per-segment colour.
+
+    *segments* is a list of ``(text, status)`` tuples. The pipe separators
+    are drawn in white so the eye groups the segments correctly.
+    """
+    if not segments:
+        return
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    sep = " | "
+    (sep_w, _), _ = cv2.getTextSize(sep, font, font_scale, thickness)
+
+    # Pre-compute text size of the line so we can paint a thin shadow band
+    # behind it for legibility on bright backgrounds.
+    total_w = 0
+    h_max = 0
+    for i, (text, _status) in enumerate(segments):
+        (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        total_w += tw
+        h_max = max(h_max, th)
+        if i < len(segments) - 1:
+            total_w += sep_w
+
+    pad = 4
+    band_y1 = y
+    band_y2 = y + h_max + pad * 2
+    cv2.rectangle(
+        img,
+        (x - 2, band_y1),
+        (x + total_w + 4, band_y2),
+        (0, 0, 0), -1,
+    )
+
+    text_y = band_y2 - pad
+    cur_x = x
+    for i, (text, status) in enumerate(segments):
+        color = _STATUS_FILL_BGR.get(status, COLOR_UNKNOWN_BGR)
+        cv2.putText(
+            img, text, (cur_x, text_y),
+            font, font_scale, color, thickness, cv2.LINE_AA,
+        )
+        (tw, _th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        cur_x += tw
+        if i < len(segments) - 1:
+            cv2.putText(
+                img, sep, (cur_x, text_y),
+                font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA,
+            )
+            cur_x += sep_w
 
 
 def _draw_icon_badge(

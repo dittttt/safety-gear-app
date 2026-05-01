@@ -215,9 +215,14 @@ def discover_camera_devices(max_index: int = 8) -> List[CameraDevice]:
     if callable(set_log_level):
         try:
             prev_log_level = get_log_level() if callable(get_log_level) else None
-            error_level = getattr(cv2, "LOG_LEVEL_ERROR", None)
-            if error_level is not None:
-                set_log_level(error_level)
+            # Use SILENT (not ERROR) — the "Failed list devices for backend
+            # dshow" line comes through as WARN from cap_ffmpeg_impl.hpp and
+            # ERROR isn't tight enough to suppress it.
+            silent_level = getattr(cv2, "LOG_LEVEL_SILENT", None)
+            if silent_level is None:
+                silent_level = getattr(cv2, "LOG_LEVEL_ERROR", None)
+            if silent_level is not None:
+                set_log_level(silent_level)
         except Exception:
             prev_log_level = None
 

@@ -150,3 +150,22 @@ stdout-json={"ok": false, "error": "No module named 'tensorrt'", "tb": "Tracebac
 14:38:42 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
 14:38:42 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
 14:38:51 INFO Export OK in 8.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best_openvino_model
+16:18:13 INFO ConvertWorker starting — 2 job(s)
+16:18:13 INFO [1/2] Job start: cid=-1  file=best.pt  device=cuda  fmt=engine
+16:18:13 INFO [1/2] Exporting best → ENGINE (imgsz=640) — TensorRT build takes 3-8 min, please wait…
+16:26:13 WARNING TensorRT export failed for best — will use ONNX for this and all remaining GPU models: export timed out after 480s (format=engine)
+16:26:24 INFO Export OK in 491.1s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best.onnx
+16:26:24 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
+16:26:24 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
+16:26:34 INFO Export OK in 10.0s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best_openvino_model
+16:41:16 INFO ConvertWorker starting — 1 job(s)
+16:41:16 INFO [1/1] Job start: cid=-1  file=best.pt  device=cuda  fmt=engine
+16:41:16 INFO [1/1] Exporting best → ENGINE (imgsz=640) — TensorRT build takes 5-20 min on first run, please wait…
+16:52:00 INFO Export OK in 644.3s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best.engine
+09:52:10 INFO ConvertWorker starting — 2 job(s)
+09:52:10 INFO [1/2] Job start: cid=-1  file=best.pt  device=cuda  fmt=engine
+09:52:10 INFO [1/2] Exporting best → ENGINE (imgsz=640) — TensorRT build takes 5-20 min on first run, please wait…
+10:03:16 INFO Export OK in 666.7s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best.engine
+10:03:16 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
+10:03:16 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
+10:03:30 INFO Export OK in 13.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best_openvino_model

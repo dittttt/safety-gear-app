@@ -14,6 +14,12 @@ match_thresh: 0.8
 proximity_thresh: 0.5
 appearance_thresh: 0.25
 
+# Disable ReID explicitly — we do not ship a ReID model with the app.
+# Newer Ultralytics versions warn (or error) if appearance_thresh is set
+# without with_reid, which used to silently fall the inference engine
+# back to plain predict() (losing track IDs for the rest of the video).
+with_reid: false
+
 fuse_score: true
 
 # Camera Motion Compensation / Global Motion Compensation

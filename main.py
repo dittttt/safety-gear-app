@@ -21,6 +21,18 @@ os.environ.setdefault(
 # Suppress TensorRT [I]/[W] boot messages (engine size, MemUsage, logger warn).
 os.environ.setdefault("TRT_LOGGER_SEVERITY", "3")
 
+# Silence OpenCV's WARN-level globals (e.g. "VIDEOIO/FFMPEG: Failed list
+# devices for backend dshow" emitted while probing camera indexes on Windows).
+# Must be done before any probe call; doing it here guarantees the very first
+# import of cv2 anywhere in the app picks up SILENT before VideoCapture runs.
+try:
+    import cv2 as _cv2  # noqa: E402
+    _silent = getattr(_cv2, "LOG_LEVEL_SILENT", None)
+    if _silent is not None and hasattr(_cv2, "setLogLevel"):
+        _cv2.setLogLevel(_silent)  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 from PyQt5 import QtCore, QtWidgets  # noqa: E402
 from gui.main_window import MainWindow  # noqa: E402
 

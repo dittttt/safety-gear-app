@@ -8,7 +8,7 @@ import os, queue, tempfile, time
 from typing import Dict, Optional, TYPE_CHECKING
 import cv2, numpy as np, qtawesome as qta
 from PyQt5 import QtCore, QtGui, QtWidgets
-from config import TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS, MODEL_EXTENSIONS
+from config import TARGET_CLASS_IDS, CLASS_NAMES, VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, MODEL_EXTENSIONS
 from utils.model_registry import discover_models, _detect_format, _FORMAT_LABEL, cleanup_onnx_artifacts
 from pipeline.state import PipelineState
 from utils.runtime_check import detect as _detect_runtimes
@@ -56,9 +56,27 @@ _VIOLATION_LABELS = {
 # single unified detector for every class id, so model_combo / browse /
 # convert widgets are stored once under this key instead of once per class.
 _UNIFIED_KEY = -1
+
+# Per-class FontAwesome (fa5s) icon names for the rail pills and any
+# other compact iconography. Keyed by lowercase class name from
+# `config.CLASS_NAMES`.
+_CLASS_FA_ICONS: Dict[str, str] = {
+    "motorcycle": "motorcycle",
+    "rider": "user",
+    "helmet": "hard-hat",
+    "no helmet": "hard-hat",
+    "footwear": "shoe-prints",
+    "improper footwear": "shoe-prints",
+}
+
+def _class_fa_name(cname: str) -> str:
+    return _CLASS_FA_ICONS.get(str(cname).strip().lower(), "circle")
+
 _STAT_ITEMS = (
     ("motorcycles", "Motorcycles"),
     ("riders", "Riders"),
+    ("helmets", "Helmets"),
+    ("footwear", "Footwear"),
     ("helmet_unknown", "Helmet ?"),
     ("footwear_unknown", "Footwear ?"),
     ("improper_footwear", "Bad Footwear"),
@@ -78,6 +96,14 @@ _CLASS_INFER_TRANSLATE = str.maketrans("-_.", "   ")
 class _AlignedComboBox(QtWidgets.QComboBox):
     """QComboBox that shows a speed-menu-style QMenu popup instead of the
     native Qt dropdown, giving full style control."""
+
+    # Time of the most recently dismissed popup. Used to swallow the
+    # second click of a click-to-toggle gesture: clicking the combo while
+    # its popup is open dismisses the menu *and* fires a fresh
+    # showPopup() on the release event, which the user perceives as
+    # "the dropdown won't close". Suppressing presses for ~150 ms after
+    # close gives the toggle the expected behaviour.
+    _popup_dismissed_at: float = 0.0
 
     def showPopup(self) -> None:
         menu = QtWidgets.QMenu(self)
@@ -118,8 +144,18 @@ class _AlignedComboBox(QtWidgets.QComboBox):
             act.setChecked(i == self.currentIndex())
         pos = self.mapToGlobal(QtCore.QPoint(0, self.height()))
         chosen = menu.exec_(pos)
+        # Stamp the dismissal time so a follow-up mouse press on the combo
+        # within ~150 ms (i.e. the click that closed the menu) doesn't
+        # reopen it. Without this the popup feels permanently "stuck open".
+        self._popup_dismissed_at = time.perf_counter()
         if chosen is not None:
             self.setCurrentIndex(chosen.data())
+
+    def mousePressEvent(self, ev) -> None:  # noqa: D401  (Qt method)
+        if (time.perf_counter() - self._popup_dismissed_at) < 0.15:
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
 
 
 class _CenteredComboBox(_AlignedComboBox):
@@ -209,13 +245,30 @@ def _qss(s: float, chk: str) -> str:
         f"#sidebar{{background:{_BG_SB};border-right:1px solid {_BD};}}"
         f"#sidebar QLabel{{color:{_T};}}"
         f"#sidebarTitle{{font-size:{px(13)};font-weight:600;color:{_TH};"
-        f"padding:{px(6)} 0 {px(10)} 0;margin:0;letter-spacing:0.5px;}}"
-        f"#sectionLabel{{font-size:{px(10)};font-weight:600;color:{_TD};"
+        f"padding:{px(6)} 0 {px(10)} 0;margin:0;letter-spacing:0.5px;"
+        f"qproperty-indent:0;}}"
+        f"#sectionLabel{{font-size:{px(10)};font-weight:600;color:{_T};"
         f"text-transform:uppercase;"
         f"padding:{px(14)} 0 {px(4)} 0;margin:0;"
         f"qproperty-indent:0;}}"
         f"#modelCard{{background:transparent;border:none;"
         f"border-radius:0;padding:{px(2)} 0;margin:0;}}"
+        # Classes block sits inside an outlined card for visual grouping.
+        f"#classesCard{{background:rgba(255,255,255,0.025);"
+        f"border:1px solid {_BD};border-radius:{_r_sm};"
+        f"padding:0;margin:0;}}"
+        f"#classesCard QLabel{{background:transparent;}}"
+        f"#classesCard QCheckBox{{background:transparent;}}"
+        # Compact double-spin used for per-class conf / IoU.
+        f"QDoubleSpinBox#thrSpin{{background:{_BG};color:{_T};"
+        f"border:1px solid {_BD};border-radius:{_r_sm};"
+        f"padding:{px(1)} {px(4)};font-size:{px(10)};"
+        f"font-family:'Consolas','Courier New',monospace;}}"
+        f"QDoubleSpinBox#thrSpin:focus{{border:1px solid #3a3a3a;}}"
+        f"QDoubleSpinBox#thrSpin:disabled{{color:#3a3a3a;"
+        f"background:#0e0e0e;border-color:#181818;}}"
+        f"QDoubleSpinBox#thrSpin::up-button,"
+        f"QDoubleSpinBox#thrSpin::down-button{{width:0;height:0;border:none;}}"
         f"#modelFileIcon{{background:transparent;border:none;min-width:0;"
         f"padding:0;margin:0;}}"
         f"#modelFileIcon:hover{{background:rgba(255,255,255,0.06);"
@@ -229,6 +282,14 @@ def _qss(s: float, chk: str) -> str:
         f"border-radius:0;}}"
         f"#videoFileRow *{{background:transparent;}}"
         f"#videoFileRow:hover{{background:rgba(255,255,255,0.04);}}"
+        # Source picker boxes (folder + camera icons in idle source row)
+        f"QPushButton#sourceIconBox{{background:{_BG};color:{_T};"
+        f"border:1px solid {_BD};border-radius:{_r};padding:0;}}"
+        f"QPushButton#sourceIconBox:hover{{background:#1a1a1a;"
+        f"border-color:{_TH};}}"
+        f"QPushButton#sourceIconBox:pressed{{background:#222;}}"
+        f"QPushButton#sourceIconBox:focus{{outline:none;"
+        f"border-color:{_BD};background:{_BG};}}"
         # buttons
         f"QPushButton{{background:{_BG};color:{_T};border:1px solid {_BD};"
         f"border-radius:{_r};padding:{px(5)} {px(12)};"
@@ -409,6 +470,14 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self._log_error(f"Supabase init failed: {e}")
         self._timer.start()
+        # Show the live config string in the status bar from the get-go
+        # (instead of the old "Ready" placeholder).
+        QtCore.QTimer.singleShot(0, self._refresh_status_bar)
+        # Apply the initial advanced-threshold gating so per-class
+        # spinboxes render as visibly disabled at startup (before the
+        # user toggles the checkbox for the first time).
+        QtCore.QTimer.singleShot(
+            0, lambda: self._on_advanced_thr_toggled(self.chkAdvancedThr.isChecked()))
 
     # ── helpers ───────────────────────────────────────────────────────────
 
@@ -518,7 +587,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._splitter.setSizes(
             [int(260 * _S), int(805 * _S), self._console_default_w])
 
-        def _on_splitter_moved(*_a):
+        # Sidebar / console widths are clamped by the widgets' own
+        # min/max (sidebar 180–300, console 100–640). The splitter handler
+        # only tracks the user's chosen console width so reopening it
+        # restores the previous size.
+        def _on_splitter_moved(pos, idx):
             sizes = self._splitter.sizes()
             if len(sizes) >= 3 and self._consolePanel.isVisible() and sizes[2] > 0:
                 self._console_last_w = sizes[2]
@@ -531,8 +604,12 @@ class MainWindow(QtWidgets.QMainWindow):
         tr.setContentsMargins(int(12*_S), 0, int(10*_S), 0)
         tr.setSpacing(int(8 * _S))
 
-        # Hamburger – toggles sidebar between full and collapsed (rail).
+        # Hamburger → toggle checkbox-style button. Single source of truth
+        # for sidebar visibility (the rail no longer carries its own expand
+        # button — the user only ever sees this one control).
         self.btnHamburger = self._ibtn("bars", "Toggle sidebar")
+        self.btnHamburger.setCheckable(True)
+        self.btnHamburger.setChecked(True)
         tr.addWidget(self.btnHamburger, 0, QtCore.Qt.AlignVCenter)
 
         title = QtWidgets.QLabel("Safety Gear Compliance")
@@ -548,6 +625,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Logs / console panel toggle
         self.btnLogs = self._ibtn("terminal", "Show console (logs)")
         tr.addWidget(self.btnLogs, 0, QtCore.Qt.AlignVCenter)
+
+        # Settings cog — opens the Settings / Credits / Exit popup.
+        self.btnSettings = self._ibtn("cog", "Settings")
+        tr.addWidget(self.btnSettings, 0, QtCore.Qt.AlignVCenter)
 
         vbox.addWidget(tb)
 
@@ -733,9 +814,11 @@ class MainWindow(QtWidgets.QMainWindow):
         vid_sec_lbl = self._section("VIDEO / DEVICE")
         vid_sec_lbl.setContentsMargins(0, 0, 0, 0)
         # Override the CSS padding so the layout margin drives the spacing,
-        # letting the button align vertically with the label text.
+        # letting the button align vertically with the label text. Match the
+        # default #sectionLabel styling exactly otherwise this header looks
+        # thinner / dimmer than its siblings.
         vid_sec_lbl.setStyleSheet(
-            f"color:{_TD};font-size:{int(10*_S)}px;font-weight:600;"
+            f"color:{_T};font-size:{int(10*_S)}px;font-weight:600;"
             "text-transform:uppercase;padding:0;margin:0;"
             "qproperty-indent:0;"
         )
@@ -748,22 +831,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnRefreshCams.setFocusPolicy(QtCore.Qt.NoFocus)
         self.btnRefreshCams.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.btnRefreshCams.setToolTip("Refresh camera list")
-        self.btnRefreshCams.setIcon(_fa("sync-alt", _TD, cam_icon_sz))
+        self.btnRefreshCams.setIcon(_fa("sync-alt", _T, cam_icon_sz))
         self.btnRefreshCams.setFixedSize(int(22 * _S), int(22 * _S))
         vid_sec_lay.addWidget(self.btnRefreshCams, 0, QtCore.Qt.AlignVCenter)
         
         lay.addLayout(vid_sec_lay)
 
         self.btnLoadVideo = QtWidgets.QPushButton()
-        isz = int(13 * _S)
+        isz = int(16 * _S)
+        self.btnLoadVideo.setObjectName("sourceIconBox")
         self.btnLoadVideo.setIcon(_fa("folder-open", _T, isz))
         self.btnLoadVideo.setIconSize(QtCore.QSize(isz, isz))
-        self.btnLoadVideo.setText("  Load Video")
-        self.btnLoadVideo.setFixedHeight(int(28 * _S))
+        self.btnLoadVideo.setToolTip("Load video from file")
+        self.btnLoadVideo.setFixedHeight(int(34 * _S))
         self.btnLoadVideo.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnLoadVideo.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.btnLoadVideo.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        lay.addWidget(self.btnLoadVideo)
+
+        # Camera icon-box — when nothing is selected, displays just the
+        # video icon and opens a popup of devices on click. After a
+        # selection it transforms into a full-width interactive combo
+        # showing the device name (handled in `_on_camera_scan_completed`
+        # / `_on_camera_combo_changed` via `_set_camera_ui_state`).
+        self.btnPickCamera = QtWidgets.QPushButton()
+        self.btnPickCamera.setObjectName("sourceIconBox")
+        self.btnPickCamera.setIcon(_fa("video", _T, isz))
+        self.btnPickCamera.setIconSize(QtCore.QSize(isz, isz))
+        self.btnPickCamera.setToolTip("Choose camera device")
+        self.btnPickCamera.setFixedHeight(int(34 * _S))
+        self.btnPickCamera.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnPickCamera.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btnPickCamera.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        # Idle row — two equal-width icon boxes side-by-side.
+        self._sourceIdleRow = QtWidgets.QWidget()
+        _sirl = QtWidgets.QHBoxLayout(self._sourceIdleRow)
+        _sirl.setContentsMargins(0, 0, 0, 0)
+        _sirl.setSpacing(int(6 * _S))
+        _sirl.addWidget(self.btnLoadVideo, 1)
+        _sirl.addWidget(self.btnPickCamera, 1)
+        lay.addWidget(self._sourceIdleRow)
 
         self._vfWidget = QtWidgets.QWidget()
         self._vfWidget.setObjectName("videoFileRow")
@@ -795,45 +904,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnCloseVid.setFocusPolicy(QtCore.Qt.NoFocus)
         self.btnCloseVid.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         vfr.addWidget(self.btnCloseVid)
-        self._vfWidget.setFixedHeight(int(28 * _S))
+        self._vfWidget.setFixedHeight(int(34 * _S))
         self._vfWidget.setVisible(False)
         lay.addWidget(self._vfWidget)
 
-        cam_lbl = QtWidgets.QLabel("Or")
-        cam_lbl.setAlignment(QtCore.Qt.AlignCenter)
-        cam_lbl.setObjectName("sliderLabel")
-        lay.addWidget(cam_lbl)
-
-        cam_row = QtWidgets.QHBoxLayout()
-        cam_row.setContentsMargins(0, 0, 0, 0)
-        cam_row.setSpacing(int(6 * _S))
+        # Camera "selected" row — full-width combo + close button. Only
+        # visible when a camera device is the active source.
+        self._camSelRow = QtWidgets.QWidget()
+        _csl = QtWidgets.QHBoxLayout(self._camSelRow)
+        _csl.setContentsMargins(0, 0, 0, 0)
+        _csl.setSpacing(int(4 * _S))
         self.camCombo = _CenteredComboBox()
         self.camCombo.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
         self.camCombo.setMinimumContentsLength(0)
-        
         self.camCombo.setObjectName("loadVideoCombo")
-        self.camCombo.setFixedHeight(int(28 * _S))
+        self.camCombo.setFixedHeight(int(34 * _S))
         self.camCombo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.camCombo.setIconSize(QtCore.QSize(int(13 * _S), int(13 * _S)))
         self.camCombo.addItem(_fa("video", _T, int(13 * _S)), "Choose device", {"type": "none"})
-        
-        cam_row.addWidget(self.camCombo, stretch=1)
+        _csl.addWidget(self.camCombo, 1)
+        self.btnCloseCam = QtWidgets.QPushButton()
+        self.btnCloseCam.setIcon(_fa("times", _TD, csz))
+        self.btnCloseCam.setIconSize(QtCore.QSize(csz, csz))
+        self.btnCloseCam.setObjectName("closeVideoBtn")
+        self.btnCloseCam.setToolTip("Disconnect camera")
+        self.btnCloseCam.setFlat(True)
+        self.btnCloseCam.setFixedSize(_sq, _sq)
+        self.btnCloseCam.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.btnCloseCam.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        _csl.addWidget(self.btnCloseCam)
+        self._camSelRow.setVisible(False)
+        lay.addWidget(self._camSelRow)
 
-        lay.addLayout(cam_row)
         lay.addSpacing(int(6 * _S))
 
         # MODELS
         lay.addWidget(self._section("MODELS"))
 
+        # ``btnToggleAllModels`` is created here but added to the MODELS
+        # card layout below (after the conf/iou sliders + Advanced toggle)
+        # so it sits directly above the per-class rows.
         self.btnToggleAllModels = QtWidgets.QPushButton("Enable / Disable All")
         self.btnToggleAllModels.setFixedHeight(int(26 * _S))
         self.btnToggleAllModels.setFocusPolicy(QtCore.Qt.NoFocus)
         self.btnToggleAllModels.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        lay.addWidget(self.btnToggleAllModels)
-        lay.addSpacing(int(4 * _S))
 
         self._mtog: Dict[int, QtWidgets.QCheckBox] = {}
         self._mcolor_dot: Dict[int, QtWidgets.QPushButton] = {}
@@ -855,14 +972,45 @@ class MainWindow(QtWidgets.QMainWindow):
         ml.setSpacing(int(6 * _S))
 
         # ── Unified model picker (one per app, regardless of class) ──────
-        u_lbl = QtWidgets.QLabel("Unified Detector")
+        # Header row: subheader label on the left, browse + optimise icon
+        # buttons on the right, perfectly aligned with the label baseline.
+        u_hdr = QtWidgets.QHBoxLayout()
+        u_hdr.setContentsMargins(0, 0, 0, 0)
+        u_hdr.setSpacing(int(6 * _S))
+
+        u_lbl = QtWidgets.QLabel("Inference Engine")
         u_lbl.setObjectName("sliderLabel")
-        ml.addWidget(u_lbl)
+        u_hdr.addWidget(u_lbl, 1, QtCore.Qt.AlignVCenter)
 
-        u_row = QtWidgets.QHBoxLayout()
-        u_row.setContentsMargins(0, 0, 0, 0)
-        u_row.setSpacing(int(6 * _S))
+        u_browse = QtWidgets.QPushButton()
+        u_browse.setObjectName("iconBtn")
+        u_browse.setIcon(_fa("folder-open", _TD, _bisz))
+        u_browse.setIconSize(QtCore.QSize(_bisz, _bisz))
+        u_browse.setFixedSize(_bsq, _bsq)
+        u_browse.setToolTip("Browse for inference engine model")
+        u_browse.setFlat(True)
+        u_browse.setFocusPolicy(QtCore.Qt.NoFocus)
+        u_browse.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self._mbrowse[_UNIFIED_KEY] = u_browse
+        u_hdr.addWidget(u_browse, 0, QtCore.Qt.AlignVCenter)
 
+        u_conv = QtWidgets.QPushButton()
+        u_conv.setObjectName("iconBtn")
+        u_conv.setIcon(_fa("bolt", _TD, _bisz))
+        u_conv.setIconSize(QtCore.QSize(_bisz, _bisz))
+        u_conv.setFixedSize(_bsq, _bsq)
+        u_conv.setToolTip("Optimise inference engine")
+        u_conv.setFlat(True)
+        u_conv.setFocusPolicy(QtCore.Qt.NoFocus)
+        u_conv.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        u_conv.setVisible(False)
+        self._mconv[_UNIFIED_KEY] = u_conv
+        u_hdr.addWidget(u_conv, 0, QtCore.Qt.AlignVCenter)
+
+        ml.addLayout(u_hdr)
+
+        # Combo on its own full-width row so long file names don't get
+        # truncated by neighbouring chrome.
         u_combo = _AlignedComboBox()
         u_combo.setObjectName("modelCombo")
         u_combo.setMinimumHeight(int(24 * _S))
@@ -876,42 +1024,43 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
         u_combo.setMinimumContentsLength(0)
         self._mcombo[_UNIFIED_KEY] = u_combo
-        u_row.addWidget(u_combo, stretch=1)
+        ml.addWidget(u_combo)
 
-        u_browse = QtWidgets.QPushButton()
-        u_browse.setObjectName("iconBtn")
-        u_browse.setIcon(_fa("folder-open", _TD, _bisz))
-        u_browse.setIconSize(QtCore.QSize(_bisz, _bisz))
-        u_browse.setFixedSize(_bsq, _bsq)
-        u_browse.setToolTip("Browse for unified detector model")
-        u_browse.setFlat(True)
-        u_browse.setFocusPolicy(QtCore.Qt.NoFocus)
-        u_browse.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self._mbrowse[_UNIFIED_KEY] = u_browse
-        u_row.addWidget(u_browse, 0, QtCore.Qt.AlignVCenter)
-
-        u_conv = QtWidgets.QPushButton()
-        u_conv.setObjectName("iconBtn")
-        u_conv.setIcon(_fa("bolt", _TD, _bisz))
-        u_conv.setIconSize(QtCore.QSize(_bisz, _bisz))
-        u_conv.setFixedSize(_bsq, _bsq)
-        u_conv.setToolTip("Optimise unified detector")
-        u_conv.setFlat(True)
-        u_conv.setFocusPolicy(QtCore.Qt.NoFocus)
-        u_conv.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        u_conv.setVisible(False)
-        self._mconv[_UNIFIED_KEY] = u_conv
-        u_row.addWidget(u_conv, 0, QtCore.Qt.AlignVCenter)
-
-        ml.addLayout(u_row)
-        ml.addSpacing(int(4 * _S))
+        lay.addWidget(mcard)
 
         # ── Per-class detection toggles ─────────────────────────────────
-        # The single unified detector emits every class; these checkboxes
-        # filter which classes the pipeline acts on (visibility + stats).
-        cls_lbl = QtWidgets.QLabel("Classes")
-        cls_lbl.setObjectName("sliderLabel")
-        ml.addWidget(cls_lbl)
+        # Built into a separate card here, but added to the sidebar later
+        # (after the DETECTION SETTINGS section) so the per-class rows live
+        # under their own "CLASSES" section header.
+        # Per-class spinboxes for confidence + IoU let the user tune
+        # thresholds individually. Stored on PipelineState; ``None`` =
+        # use config defaults. They are disabled unless the
+        # "Advanced: per-class conf/IoU" toggle is on (set later).
+        self._mconf_spin: Dict[int, QtWidgets.QDoubleSpinBox] = {}
+        self._miou_spin: Dict[int, QtWidgets.QDoubleSpinBox] = {}
+
+        def _make_thr_spin(initial: float, tip: str) -> QtWidgets.QDoubleSpinBox:
+            s = QtWidgets.QDoubleSpinBox()
+            s.setObjectName("thrSpin")
+            s.setRange(0.0, 1.0)
+            s.setSingleStep(0.05)
+            s.setDecimals(2)
+            s.setValue(float(initial))
+            s.setFixedWidth(int(46 * _S))
+            s.setFixedHeight(int(20 * _S))
+            s.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+            s.setAlignment(QtCore.Qt.AlignCenter)
+            s.setFocusPolicy(QtCore.Qt.ClickFocus)
+            s.setToolTip(tip)
+            # Disabled by default — only become interactive when the
+            # "Advanced: per-class conf/IoU" toggle is enabled.
+            s.setEnabled(False)
+            return s
+
+        ccard = QtWidgets.QWidget(); ccard.setObjectName("modelCard")
+        cl = QtWidgets.QVBoxLayout(ccard)
+        cl.setContentsMargins(0, int(4*_S), 0, int(4*_S))
+        cl.setSpacing(int(6 * _S))
 
         for cid in TARGET_CLASS_IDS:
             name = CLASS_NAMES[cid]
@@ -940,19 +1089,26 @@ class MainWindow(QtWidgets.QMainWindow):
             chk = QtWidgets.QCheckBox(name)
             chk.setChecked(True)
             self._mtog[cid] = chk
-            row.addWidget(chk)
-            row.addStretch()
+            row.addWidget(chk, 1)
 
-            ml.addLayout(row)
+            conf_spin = _make_thr_spin(0.25, f"{name}: confidence threshold")
+            iou_spin = _make_thr_spin(0.45, f"{name}: IoU NMS threshold")
+            self._mconf_spin[cid] = conf_spin
+            self._miou_spin[cid] = iou_spin
+            row.addWidget(conf_spin, 0, QtCore.Qt.AlignVCenter)
+            row.addWidget(iou_spin, 0, QtCore.Qt.AlignVCenter)
 
-        lay.addWidget(mcard)
+            cl.addLayout(row)
+
+        # Stash for adding to the sidebar after the DETECTION SETTINGS card.
+        self._classesCard = ccard
 
         # Optimize All button (legacy alias for the unified converter)
         self.btnOptimizeAll = QtWidgets.QPushButton()
         _oisz = int(13 * _S)
         self.btnOptimizeAll.setIcon(_fa("bolt", _T, _oisz))
         self.btnOptimizeAll.setIconSize(QtCore.QSize(_oisz, _oisz))
-        self.btnOptimizeAll.setText("  Optimize Unified Detector")
+        self.btnOptimizeAll.setText("  Optimize Inference Engine")
         self.btnOptimizeAll.setFixedHeight(int(28 * _S))
         self.btnOptimizeAll.setFocusPolicy(QtCore.Qt.NoFocus)
         self.btnOptimizeAll.setSizePolicy(
@@ -960,20 +1116,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnOptimizeAll.setVisible(False)
         lay.addWidget(self.btnOptimizeAll)
 
-        lay.addSpacing(int(6 * _S))
-
-        # DETECTION
-        lay.addWidget(self._section("DETECTION"))
-        dcard = QtWidgets.QWidget(); dcard.setObjectName("modelCard")
-        dl = QtWidgets.QVBoxLayout(dcard)
-        dl.setContentsMargins(0, int(4*_S), 0, int(4*_S))
-        dl.setSpacing(int(5 * _S))
+        # ── Confidence / IoU sliders + Advanced toggle (under MODELS) ────
+        # Visually grouped with the inference-engine picker so all the
+        # detector-related controls live together.
+        thr_card = QtWidgets.QWidget(); thr_card.setObjectName("modelCard")
+        tl = QtWidgets.QVBoxLayout(thr_card)
+        tl.setContentsMargins(0, int(4*_S), 0, int(4*_S))
+        tl.setSpacing(int(5 * _S))
 
         for attr, label, default in [("conf", "Confidence", 25),
                                      ("iou", "IoU", 30)]:
             lbl = QtWidgets.QLabel(label)
             lbl.setObjectName("sliderLabel")
-            dl.addWidget(lbl)
+            tl.addWidget(lbl)
             r = QtWidgets.QHBoxLayout(); r.setSpacing(int(6 * _S))
             r.setContentsMargins(0, 0, 0, 0)
             slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -985,9 +1140,61 @@ class MainWindow(QtWidgets.QMainWindow):
             val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             val.setFixedWidth(int(28 * _S))
             r.addWidget(slider, stretch=1); r.addWidget(val)
-            dl.addLayout(r)
+            tl.addLayout(r)
             setattr(self, f"{attr}Slider", slider)
             setattr(self, f"{attr}Label", val)
+
+        # Advanced: per-class conf/IoU toggle.
+        self.chkAdvancedThr = QtWidgets.QCheckBox(
+            "Advanced: per-class conf/IoU")
+        self.chkAdvancedThr.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.chkAdvancedThr.setChecked(False)
+        self.chkAdvancedThr.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.chkAdvancedThr.setToolTip(
+            "When OFF: the Confidence/IoU sliders apply globally.\n"
+            "When ON: the per-class spinboxes below override them."
+        )
+        tl.addWidget(self.chkAdvancedThr)
+
+        lay.addWidget(thr_card)
+
+        # Enable / Disable All button — sits directly above the per-class
+        # rows so the relationship is obvious.
+        lay.addWidget(self.btnToggleAllModels)
+        lay.addSpacing(int(2 * _S))
+
+        # Per-class rows live inside the MODELS section (no separate
+        # CLASSES header). Built earlier into ``self._classesCard``.
+        lay.addWidget(self._classesCard)
+
+        lay.addSpacing(int(6 * _S))
+
+        # DETECTION SETTINGS — performance-tuning controls only
+        # (stride / size / device / runtime toggles).
+        lay.addWidget(self._section("DETECTION SETTINGS"))
+        dcard = QtWidgets.QWidget(); dcard.setObjectName("modelCard")
+        dl = QtWidgets.QVBoxLayout(dcard)
+        dl.setContentsMargins(0, int(4*_S), 0, int(4*_S))
+        dl.setSpacing(int(5 * _S))
+
+        # Inference Stride — kept ABOVE Inference Size.
+        stride_lbl = QtWidgets.QLabel("Inference Stride")
+        stride_lbl.setObjectName("sliderLabel")
+        dl.addWidget(stride_lbl)
+        sr = QtWidgets.QHBoxLayout(); sr.setSpacing(int(6 * _S))
+        sr.setContentsMargins(0, 0, 0, 0)
+        self.strideSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.strideSlider.setRange(1, 16)
+        self.strideSlider.setValue(3)
+        self.strideSlider.setMinimumHeight(int(18 * _S))
+        self.strideSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.strideLabel = QtWidgets.QLabel("1")
+        self.strideLabel.setObjectName("sliderLabel")
+        self.strideLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.strideLabel.setFixedWidth(int(16 * _S))
+        sr.addWidget(self.strideSlider, stretch=1)
+        sr.addWidget(self.strideLabel)
+        dl.addLayout(sr)
 
         perf_lbl = QtWidgets.QLabel("Inference Size")
         perf_lbl.setObjectName("sliderLabel")
@@ -1013,6 +1220,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.deviceCombo.addItem("CPU", "cpu")
         dl.addWidget(self.deviceCombo)
 
+        # ── Toggle group: visually separated from sliders / combos by a
+        # small spacer above and below so the boolean options read as a
+        # distinct block. Order: FP16 → Overload → Tracker → DB Logging.
+        dl.addSpacing(int(6 * _S))
+
         self.chkFp16 = QtWidgets.QCheckBox("Use FP16 instead of FP32")
         self.chkFp16.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.chkFp16.setChecked(False)
@@ -1025,29 +1237,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chkOverload.setFocusPolicy(QtCore.Qt.NoFocus)
         dl.addWidget(self.chkOverload)
 
+        self.chkTracker = QtWidgets.QCheckBox("Tracker (BoT-SORT)")
+        self.chkTracker.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.chkTracker.setChecked(self._state.is_tracker_enabled())
+        self.chkTracker.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.chkTracker.setToolTip(
+            "Enable cross-frame tracking for stable IDs and smoother boxes.\n"
+            "Disabling switches back to per-frame predict() which is faster\n"
+            "but flickers and has no rider IDs."
+        )
+        dl.addWidget(self.chkTracker)
+
         self.chkDbLogging = QtWidgets.QCheckBox("DB Logging (Supabase)")
         self.chkDbLogging.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.chkDbLogging.setChecked(True)
+        # Default OFF — opt-in to avoid surprise network writes.
+        self.chkDbLogging.setChecked(False)
         self.chkDbLogging.setFocusPolicy(QtCore.Qt.NoFocus)
         dl.addWidget(self.chkDbLogging)
-
-        stride_lbl = QtWidgets.QLabel("Inference Stride")
-        stride_lbl.setObjectName("sliderLabel")
-        dl.addWidget(stride_lbl)
-        sr = QtWidgets.QHBoxLayout(); sr.setSpacing(int(6 * _S))
-        sr.setContentsMargins(0, 0, 0, 0)
-        self.strideSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.strideSlider.setRange(1, 16)
-        self.strideSlider.setValue(3)
-        self.strideSlider.setMinimumHeight(int(18 * _S))
-        self.strideSlider.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.strideLabel = QtWidgets.QLabel("1")
-        self.strideLabel.setObjectName("sliderLabel")
-        self.strideLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self.strideLabel.setFixedWidth(int(16 * _S))
-        sr.addWidget(self.strideSlider, stretch=1)
-        sr.addWidget(self.strideLabel)
-        dl.addLayout(sr)
 
         lay.addWidget(dcard)
         lay.addSpacing(int(6 * _S))
@@ -1074,9 +1280,24 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setSpacing(int(8 * _S))
         v.setAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
 
-        # Expand-back button at the top of the rail.
+        # Hidden expand-button kept for signal-connection compatibility
+        # (btnHamburger in the topBar is the real expand/collapse control).
         self.btnRailExpand = self._ibtn("bars", "Expand sidebar")
-        v.addWidget(self.btnRailExpand, 0, QtCore.Qt.AlignHCenter)
+        self.btnRailExpand.setCheckable(True)
+        self.btnRailExpand.setChecked(False)
+        self.btnRailExpand.setVisible(False)
+
+        # "Enable / disable all classes" checkbox at the very top of the
+        # rail. Ticked = every class on; unticked = all off.
+        self.chkRailAll = QtWidgets.QCheckBox()
+        self.chkRailAll.setChecked(True)
+        self.chkRailAll.setToolTip("Tick to enable all classes / untick to disable all")
+        self.chkRailAll.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.chkRailAll.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.chkRailAll.setFixedSize(int(13 * _S), int(13 * _S))
+        # No inline stylesheet — inherits the global app QSS so it looks
+        # identical to the sidebar checkboxes (dark fill + checkmark).
+        v.addWidget(self.chkRailAll, 0, QtCore.Qt.AlignHCenter)
 
         # Subtle divider
         sep1 = QtWidgets.QFrame()
@@ -1087,9 +1308,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rail_chk: Dict[int, QtWidgets.QCheckBox] = {}
         self._rail_dot: Dict[int, QtWidgets.QPushButton] = {}
 
-        # Per-class "pill" buttons. Coloured circle that doubles as the
-        # detection toggle; greyed-out when the class is disabled.
-        _pill = int(30 * _S)
+        # Per-class "pill" buttons. Coloured circle with a FontAwesome
+        # icon representing the class; doubles as the detection toggle and
+        # is greyed-out when disabled.
+        _pill = int(24 * _S)
+        _pill_isz = int(12 * _S)
         for cid in TARGET_CLASS_IDS:
             name = CLASS_NAMES.get(cid, "?")
             clr = self._to_qcolor_bgr(self._state.get_class_color(cid))
@@ -1100,11 +1323,15 @@ class MainWindow(QtWidgets.QMainWindow):
             chk.toggled.connect(lambda v, c=cid: self._on_rail_chk_toggled(c, v))
             self._rail_chk[cid] = chk
 
-            dot = QtWidgets.QPushButton(name[:1].upper())
+            dot = QtWidgets.QPushButton()
             dot.setObjectName("railPill")
             dot.setFixedSize(_pill, _pill)
             dot.setMinimumSize(_pill, _pill)
             dot.setMaximumSize(_pill, _pill)
+            # White icon; colored outline circle. The outline disappears
+            # (grey border) when the class is toggled off.
+            dot.setIcon(_fa(_class_fa_name(name), QtGui.QColor(_W), _pill_isz))
+            dot.setIconSize(QtCore.QSize(_pill_isz, _pill_isz))
             dot.setCheckable(True)
             dot.setChecked(True)
             dot.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
@@ -1131,25 +1358,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return rb
 
     def _rail_pill_qss(self, clr: QtGui.QColor, size: int) -> str:
-        """Build the QSS for a perfect-circle rail pill at *size* px."""
+        """Build the QSS for a minimalist rail pill: transparent bg,
+        colored circle outline when checked; dim border when unchecked."""
         r = size // 2
-        font_px = int(13 * _S)
+        bw = max(2, int(2 * _S))
         return (
             "QPushButton#railPill{"
-            f"background:{clr.name()};color:#0b0d12;"
-            "border:none;padding:0;margin:0;"
+            f"background:transparent;color:{_W};"
+            f"border:{bw}px solid {clr.name()};"
+            "padding:0;margin:0;"
             f"min-width:{size}px;max-width:{size}px;"
             f"min-height:{size}px;max-height:{size}px;"
             f"border-radius:{r}px;"
-            f"font-weight:700;font-size:{font_px}px;"
             "text-align:center;"
             "}"
             "QPushButton#railPill:!checked{"
-            f"background:{_BG};color:{_TD};"
-            f"border:1px solid {_BD};"
+            f"background:transparent;color:{_TD};"
+            f"border:{bw}px solid {_BD};"
             "}"
             "QPushButton#railPill:hover{"
-            f"border:1px solid {_TH};"
+            f"border:{bw}px solid {_TH};"
             "}"
         )
 
@@ -1160,6 +1388,12 @@ class MainWindow(QtWidgets.QMainWindow):
             chk.setChecked(value)
         else:
             self._state.set_model_enabled(cid, value)
+
+    def _on_rail_all_toggled(self, value: bool) -> None:
+        """Enable or disable all classes from the rail 'all' checkbox."""
+        for cid, chk in self._mtog.items():
+            if chk.isChecked() != value:
+                chk.setChecked(value)
 
     # ── console / logs panel ──────────────────────────────────────────────
     def _build_console_panel(self) -> QtWidgets.QWidget:
@@ -1374,7 +1608,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Push sidebar checkbox / colour state onto the rail pills."""
         if not getattr(self, "_rail_chk", None):
             return
-        _pill = int(30 * _S)
+        _pill = int(24 * _S)
+        _pill_isz = int(12 * _S)
         for cid in TARGET_CLASS_IDS:
             src = self._mtog.get(cid)
             dst = self._rail_chk.get(cid)
@@ -1391,6 +1626,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     dot.setChecked(checked)
                     dot.blockSignals(False)
                 dot.setStyleSheet(self._rail_pill_qss(clr, _pill))
+                # White icon when checked; dim when unchecked.
+                name = CLASS_NAMES.get(cid, "?")
+                glyph_clr = QtGui.QColor(_W) if checked else QtGui.QColor(_TD)
+                dot.setIcon(_fa(_class_fa_name(name), glyph_clr, _pill_isz))
+                dot.setIconSize(QtCore.QSize(_pill_isz, _pill_isz))
 
     def _toggle_sidebar_collapsed(self) -> None:
         self._sidebar_collapsed = not getattr(self, "_sidebar_collapsed", False)
@@ -1408,6 +1648,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sidebarStack.setMaximumWidth(int(300 * _S))
             self._splitter.setSizes(
                 [int(260 * _S), max(self.width() - int(260 * _S), int(400 * _S))])
+        # Keep the hamburger toggle's checked state in sync with the
+        # sidebar visibility, regardless of whether this method was
+        # triggered by the button click or invoked programmatically.
+        try:
+            self.btnHamburger.blockSignals(True)
+            self.btnHamburger.setChecked(not self._sidebar_collapsed)
+        finally:
+            self.btnHamburger.blockSignals(False)
+        try:
+            self.btnRailExpand.blockSignals(True)
+            self.btnRailExpand.setChecked(self._sidebar_collapsed)
+        finally:
+            self.btnRailExpand.blockSignals(False)
         QtCore.QTimer.singleShot(0, self._repos)
 
     def _update_model_format_labels(self) -> None:
@@ -1501,8 +1754,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnFS.setToolTip(tooltip)
 
     def _set_video_ui_state(self, loaded: bool) -> None:
-        self.btnLoadVideo.setVisible(not loaded)
+        """Show one of three rows: idle (two icon-boxes) / video (file row)
+        / camera (combo + close). When *loaded* is True the file row is
+        shown; when False, idle is shown unless a camera is currently
+        selected (handled by `_set_camera_ui_state`)."""
+        self._sourceIdleRow.setVisible(not loaded and not self._camSelRow.isVisible())
         self._vfWidget.setVisible(loaded)
+        if loaded:
+            self._camSelRow.setVisible(False)
+
+    def _set_camera_ui_state(self, selected: bool) -> None:
+        """Show / hide the camera combo row. When selected: combo + ×
+        replace the idle two-icon row. When not selected: idle row
+        returns (unless a video is loaded)."""
+        self._camSelRow.setVisible(selected)
+        if selected:
+            self._vfWidget.setVisible(False)
+            self._sourceIdleRow.setVisible(False)
+        else:
+            self._sourceIdleRow.setVisible(not self._vfWidget.isVisible())
 
     def _set_source_label(self, text: str, tooltip: str) -> None:
         self.lblVidName.setText(text)
@@ -1511,10 +1781,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_camera_combo_none(self) -> None:
         if self.camCombo.count() <= 0:
+            self._set_camera_ui_state(False)
             return
         self.camCombo.blockSignals(True)
         self.camCombo.setCurrentIndex(0)
         self.camCombo.blockSignals(False)
+        self._set_camera_ui_state(False)
 
     def _refresh_camera_devices(self) -> None:
         if self._cam_scan and self._cam_scan.isRunning():
@@ -1609,6 +1881,61 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
                 label = str(cam.get("label") or "Camera")
                 self._open_camera(cam, label)
+
+    def _on_pick_camera_clicked(self) -> None:
+        """Show device popup from the camera icon-box (idle state)."""
+        # Collect non-"none" entries from the existing combo. If none yet,
+        # trigger a refresh and show a placeholder.
+        items: list = []
+        for i in range(self.camCombo.count()):
+            d = self.camCombo.itemData(i) or {}
+            if isinstance(d, dict) and d.get("type") == "camera":
+                items.append((self.camCombo.itemText(i), d))
+
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:#161616;color:{_T};"
+            f"border:1px solid {_BD};border-radius:{int(_R*_S)}px;"
+            f"padding:4px;}}"
+            f"QMenu::item{{padding:{int(6*_S)}px {int(12*_S)}px;"
+            f"font-size:{int(10*_S)}px;border-radius:4px;}}"
+            f"QMenu::item:selected{{background:#2a2a2a;color:{_TH};}}"
+        )
+        cam_isz = int(13 * _S)
+        if not items:
+            ph = menu.addAction("No devices found — click refresh")
+            ph.setEnabled(False)
+        else:
+            for label, data in items:
+                act = menu.addAction(_fa("video", _T, cam_isz), label)
+                act.setData(data)
+        menu.addSeparator()
+        act_refresh = menu.addAction(
+            _fa("sync-alt", _T, cam_isz), "Refresh devices")
+        pos = self.btnPickCamera.mapToGlobal(
+            QtCore.QPoint(0, self.btnPickCamera.height()))
+        chosen = menu.exec_(pos)
+        if chosen is None:
+            return
+        if chosen is act_refresh:
+            self._refresh_camera_devices()
+            return
+        data = chosen.data()
+        if isinstance(data, dict) and data.get("type") == "camera":
+            cam = data.get("camera")
+            if isinstance(cam, dict):
+                # Update the combo selection so the camera-row dropdown
+                # shows the chosen device.
+                for i in range(self.camCombo.count()):
+                    d = self.camCombo.itemData(i) or {}
+                    if (isinstance(d, dict) and d.get("type") == "camera"
+                            and isinstance(d.get("camera"), dict)
+                            and d["camera"].get("key") == cam.get("key")):
+                        self.camCombo.setCurrentIndex(i)
+                        break
+                else:
+                    label = str(cam.get("label") or "Camera")
+                    self._open_camera(cam, label)
 
     # ── fullscreen ────────────────────────────────────────────────────────
 
@@ -1716,6 +2043,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _connect_signals(self) -> None:
         self.btnLoadVideo.clicked.connect(self._on_load_video)
         self.btnCloseVid.clicked.connect(self._on_close_video)
+        self.btnCloseCam.clicked.connect(self._on_close_video)
+        self.btnPickCamera.clicked.connect(self._on_pick_camera_clicked)
         self.camCombo.currentIndexChanged.connect(self._on_camera_combo_changed)
         self.btnRefreshCams.clicked.connect(self._refresh_camera_devices)
         for cid, combo in self._mcombo.items():
@@ -1747,18 +2076,28 @@ class MainWindow(QtWidgets.QMainWindow):
         for cid, chk in self._mtog.items():
             chk.toggled.connect(
                 lambda v, c=cid: self._on_sidebar_chk_toggled(c, v))
+        for cid, spin in self._mconf_spin.items():
+            spin.valueChanged.connect(
+                lambda v, c=cid: self._state.set_per_class_conf_override(c, v))
+        for cid, spin in self._miou_spin.items():
+            spin.valueChanged.connect(
+                lambda v, c=cid: self._state.set_per_class_iou_override(c, v))
         self.confSlider.valueChanged.connect(self._on_conf)
         self.iouSlider.valueChanged.connect(self._on_iou)
+        self.chkAdvancedThr.toggled.connect(self._on_advanced_thr_toggled)
         self.imgszCombo.currentIndexChanged.connect(self._on_imgsz_changed)
         self.deviceCombo.currentIndexChanged.connect(self._on_device_changed)
         self.chkFp16.toggled.connect(self._on_fp16_toggled)
         self.chkOverload.toggled.connect(self._on_overload_toggled)
         self.chkDbLogging.toggled.connect(self._on_db_logging_toggled)
+        self.chkTracker.toggled.connect(self._on_tracker_toggled)
         self.strideSlider.valueChanged.connect(self._on_stride_changed)
         self.btnHamburger.clicked.connect(self._toggle_sidebar_collapsed)
         self.btnRailExpand.clicked.connect(self._toggle_sidebar_collapsed)
+        self.chkRailAll.toggled.connect(self._on_rail_all_toggled)
         self.btnHudLock.clicked.connect(self._toggle_hud_lock)
         self.btnLogs.clicked.connect(self._toggle_console)
+        self.btnSettings.clicked.connect(self._show_settings_menu)
         self.btnClearConsole.clicked.connect(self._on_clear_console)
         self.btnCloseConsole.clicked.connect(self._toggle_console)
 
@@ -1894,11 +2233,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_load_video(self) -> None:
         source_dir = os.path.join(_ROOT, "source")
         start_dir = source_dir if os.path.isdir(source_dir) else ""
+        media_exts = " ".join(
+            f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)
+        )
         p, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select Video", start_dir,
-            "Video Files (*.mp4 *.avi *.mov *.mkv *.wmv *.flv);;All (*)")
+            self, "Select Video or Image", start_dir,
+            f"Media Files ({media_exts});;All (*)")
         if p:
-            self._open_video(p)
+            ext = os.path.splitext(p)[1].lower()
+            if ext in IMAGE_EXTENSIONS:
+                self._open_image(p)
+            else:
+                self._open_video(p)
 
     # ── model selector helpers ────────────────────────────────────────────
 
@@ -2052,6 +2398,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ext = os.path.splitext(p)[1].lower()
             if ext in VIDEO_EXTENSIONS:
                 self._open_video(p)
+            elif ext in IMAGE_EXTENSIONS:
+                self._open_image(p)
             elif ext in MODEL_EXTENSIONS:
                 cid = self._infer_class(p)
                 if cid is not None:
@@ -2110,6 +2458,27 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Loaded: {bn}  \u00b7  "
             f"{self._fmt(total / fps if fps else 0)} @ {fps:.1f} FPS")
 
+    def _open_image(self, path: str) -> None:
+        self._on_stop()
+        frame = cv2.imread(path, cv2.IMREAD_COLOR)
+        if frame is None:
+            QtWidgets.QMessageBox.critical(
+                self, "Error", f"Cannot open image:\n{path}")
+            return
+        if self._preview_cap is not None:
+            self._preview_cap.release(); self._preview_cap = None
+        self._show_frame(frame)
+        fh, fw = frame.shape[:2]
+        self._fit_window_to_video_aspect(fw, fh)
+        self._state.set_video_source(path)
+        self._video_fps, self._total_frames = 1.0, 1
+        self._init_seek()
+        self.lblTime.setText("0:00")
+        bn = os.path.basename(path)
+        self._set_source_label(bn, path)
+        self._set_camera_combo_none()
+        self._set_status(f"Loaded image: {bn}")
+
     def _open_camera(self, camera: dict, label: str) -> None:
         self._on_stop()
         # Quick open / close *just* to verify the device is reachable — we do
@@ -2140,7 +2509,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._total_frames = 0
         self._init_seek()
         self.lblTime.setText("0:00")
-        self._set_source_label(label, str(camera.get("target") or label))
+        # Camera path: keep camera row visible (combo dropdown), do NOT
+        # show the video-file row.
+        self.lblVidName.setText(label)
+        self.lblVidName.setToolTip(str(camera.get("target") or label))
+        self._set_camera_ui_state(True)
         self._set_status(f"Loaded: {label}  ·  Live @ {fps:.1f} FPS")
 
         # Auto-start playback for live cameras — there is no "paused" state
@@ -2326,12 +2699,87 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_fps(self, fps: float) -> None:
         self._current_fps = fps
 
+    @staticmethod
+    def _backend_label_for(path: str) -> str:
+        """Map a unified-detector artifact path to a short backend tag.
+
+        Always-visible in the status bar so the user can tell at a glance
+        which runtime is actually executing inference (PyTorch vs the
+        accelerated TensorRT / OpenVINO exports).
+        """
+        if not path:
+            return "\u2014"
+        p = str(path).lower()
+        if p.endswith(".engine"):
+            return "TensorRT"
+        if p.endswith(".onnx"):
+            return "ONNX"
+        if (
+            p.endswith("_openvino_model")
+            or p.endswith("_ov_model")
+            or os.path.isdir(path)
+        ):
+            return "OpenVINO"
+        if p.endswith(".pt"):
+            return "PyTorch"
+        return os.path.splitext(os.path.basename(path))[1].lstrip(".").upper() or "?"
+
+    def _current_backend_label(self) -> str:
+        # Every cid in state.model_paths points at the same unified file;
+        # grab whatever the first registered slot has.
+        for cid in TARGET_CLASS_IDS:
+            p = self._state.model_paths.get(cid)
+            if p:
+                return self._backend_label_for(p)
+        return "\u2014"
+
     def _on_stats(self, s: dict) -> None:
-        parts = [f"FPS {self._current_fps:.0f}"]
+        parts = [
+            f"FPS {self._current_fps:.0f}",
+            self._config_status_string(),
+        ]
         for k, lbl in _STAT_ITEMS:
             if s.get(k):
                 parts.append(f"{lbl} {s[k]}")
         self.statusLabel.setText("  \u00b7  ".join(parts))
+
+    def _config_status_string(self) -> str:
+        """One-line summary of the active inference configuration.
+
+        Always rendered in the bottom status bar so the user can see at a
+        glance which engine / device / precision / stride / tracker /
+        overload settings are in effect. Updated live whenever a sidebar
+        control changes (see `_refresh_status_bar`).
+        """
+        backend = self._current_backend_label()
+        device = self._state.get_device().upper()
+        # Show "auto" → resolved device when running.
+        infer = getattr(self, "_inferencer", None)
+        if infer is not None and getattr(infer, "_device", None):
+            resolved = str(infer._device)
+            if resolved.startswith("cuda"):
+                device = "CUDA"
+            elif resolved == "cpu":
+                device = "CPU"
+        precision = "FP16" if self._state.use_fp16() else "FP32"
+        imgsz = self._state.get_imgsz()
+        stride = self._state.get_inference_stride()
+        tracker = "Tracker" if self._state.is_tracker_enabled() else "NoTrack"
+        overload_on = self._state.get_max_riders_per_motorcycle() <= 2
+        overload = "Overload\u2713" if overload_on else "Overload\u2717"
+        return (
+            f"{backend}/{device}/{precision} \u00b7 imgsz {imgsz} \u00b7 "
+            f"stride {stride}\u00d7 \u00b7 {tracker} \u00b7 {overload}"
+        )
+
+    def _refresh_status_bar(self) -> None:
+        """Update the bottom status label when no stats packet is in flight
+        (e.g. before playback has started, or when paused). Called from any
+        sidebar handler that mutates the live config."""
+        prefix = f"FPS {self._current_fps:.0f}" if self._current_fps else "Idle"
+        self.statusLabel.setText(
+            f"{prefix}  \u00b7  {self._config_status_string()}"
+        )
 
     def _on_video_ended(self) -> None:
         self._is_playing = False
@@ -2346,10 +2794,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.iouLabel.setText(f"{v / 100:.2f}")
         self._state.set_iou(v / 100)
 
+    def _on_advanced_thr_toggled(self, enabled: bool) -> None:
+        """Switch between global conf/IoU sliders and per-class spinboxes.
+
+        OFF: global sliders drive every class; per-class spinboxes are
+             disabled and ignored (overrides cleared).
+        ON:  global sliders are disabled (still update state for the
+             "floor" used by the inference engine); per-class spinboxes
+             drive each class individually.
+        """
+        # Global sliders & their value labels — fade out when per-class
+        # mode is on so the user can't accidentally drag them.
+        for w in (self.confSlider, self.iouSlider,
+                  self.confLabel, self.iouLabel):
+            w.setEnabled(not enabled)
+        # Per-class spinboxes — only interactive in advanced mode.
+        for spin in self._mconf_spin.values():
+            spin.setEnabled(enabled)
+        for spin in self._miou_spin.values():
+            spin.setEnabled(enabled)
+        # Push current spinbox values into state when turning ON, clear
+        # the overrides when turning OFF (so global sliders fully take
+        # over again).
+        if enabled:
+            for cid, spin in self._mconf_spin.items():
+                self._state.set_per_class_conf_override(cid, float(spin.value()))
+            for cid, spin in self._miou_spin.items():
+                self._state.set_per_class_iou_override(cid, float(spin.value()))
+            self._set_status("Per-class conf/IoU enabled (global sliders ignored)")
+        else:
+            for cid in list(self._mconf_spin.keys()):
+                self._state.set_per_class_conf_override(cid, None)
+            for cid in list(self._miou_spin.keys()):
+                self._state.set_per_class_iou_override(cid, None)
+            self._set_status("Global conf/IoU sliders active")
+        self._refresh_status_bar()
+
     def _on_imgsz_changed(self) -> None:
         size = int(self.imgszCombo.currentData() or 640)
         self._state.set_imgsz(size)
-        self._set_status(f"Inference size set to {size} (takes effect on next start)")
+        # Live: state.get_imgsz() is read by the inference loop on every
+        # frame, so this takes effect immediately (no restart needed).
+        self._set_status(f"Inference size set to {size}")
+        self._refresh_status_bar()
 
     def _on_device_changed(self) -> None:
         device = str(self.deviceCombo.currentData() or "auto")
@@ -2361,15 +2848,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._resolve_auto_model(_UNIFIED_KEY)
         self._update_convert_buttons()
         self._update_model_format_labels()
-        self._set_status(f"Device set to {device.upper()} (takes effect on next start)")
+        # Device + FP16 are read by InferenceThread._load_models() at
+        # thread start; to apply them live, restart the pipeline if
+        # something is currently playing.
+        self._restart_pipeline_if_running(f"Device set to {device.upper()}")
+        self._refresh_status_bar()
 
     def _on_fp16_toggled(self, enabled: bool) -> None:
         self._state.set_use_fp16(bool(enabled))
-        self._set_status(
-            "FP16 preference enabled (used for optimization + CUDA inference)"
-            if enabled else
-            "FP16 preference disabled (use FP32)"
+        msg = (
+            "FP16 enabled (used for optimization + CUDA inference)"
+            if enabled else "FP32 (FP16 disabled)"
         )
+        self._restart_pipeline_if_running(msg)
+        self._refresh_status_bar()
 
     def _on_overload_toggled(self, enabled: bool) -> None:
         # Enabled = enforce 2-rider limit (any extra rider = overload).
@@ -2379,6 +2871,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "Overload highlighting on (>2 riders)"
             if enabled else "Overload highlighting off"
         )
+        self._refresh_status_bar()
+
+    def _on_tracker_toggled(self, enabled: bool) -> None:
+        self._state.set_tracker_enabled(bool(enabled))
+        self._set_status(
+            "Tracker enabled (BoT-SORT) — stable IDs, smoother boxes"
+            if enabled else
+            "Tracker disabled — per-frame predict (faster, no IDs, may flicker)"
+        )
+        self._refresh_status_bar()
 
     def _on_db_logging_toggled(self, enabled: bool) -> None:
         _sblog.set_enabled(bool(enabled))
@@ -2395,6 +2897,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.strideLabel.setText(str(v))
         self._state.set_inference_stride(v)
         self._set_status(f"Inference stride set to {v}x")
+        self._refresh_status_bar()
+
+    def _restart_pipeline_if_running(self, reason: str) -> None:
+        """Restart the inference pipeline so settings that are read once
+        at thread start (device, FP16, model files) take effect live."""
+        was_running = bool(
+            self._grabber and self._grabber.isRunning())
+        if not was_running:
+            self._set_status(reason)
+            return
+        was_paused = self._state.pause_event.is_set()
+        self._on_stop()
+        if self._has_active_source():
+            self._ensure_pipeline()
+            if was_paused:
+                self._state.pause_event.set()
+                self._is_playing = False
+                self.btnPlay.setIcon(self._ico_play)
+            else:
+                self._state.pause_event.clear()
+                self._is_playing = True
+                self.btnPlay.setIcon(self._ico_pause)
+            self._set_status(f"{reason} — pipeline restarted")
+        else:
+            self._set_status(reason)
 
     # ── model optimisation ────────────────────────────────────────────────
 
@@ -2452,8 +2979,26 @@ class MainWindow(QtWidgets.QMainWindow):
             btn.setToolTip(f"Optimise for {', '.join(missing)}")
             self.btnOptimizeAll.setVisible(True)
 
+    @staticmethod
+    def _expected_output_path(pt_path: str, fmt: str) -> str:
+        """Return the path Ultralytics would produce for *fmt* from *pt_path*."""
+        target_dir = os.path.dirname(os.path.abspath(pt_path))
+        stem = os.path.splitext(os.path.basename(pt_path))[0]
+        if fmt == "engine":
+            return os.path.join(target_dir, f"{stem}.engine")
+        if fmt == "onnx":
+            return os.path.join(target_dir, f"{stem}.onnx")
+        if fmt == "openvino":
+            return os.path.join(target_dir, f"{stem}_openvino_model")
+        return pt_path  # "pt" or unknown — already exists
+
     def _build_convert_jobs(self, cids=None):
-        """Return ConvertJob tuples for the unified detector (GPU + CPU)."""
+        """Return ConvertJob tuples for the unified detector (GPU + CPU).
+
+        Skips any device whose output file/directory already exists on disk.
+        """
+        from utils.runtime_check import best_format as _best_format
+
         probe_cid = next(iter(TARGET_CLASS_IDS))
         group = self._model_groups.get(probe_cid)
         if not group or not group.has_pt:
@@ -2466,9 +3011,25 @@ class MainWindow(QtWidgets.QMainWindow):
         has_cuda = self._has_cuda()
         half = self._state.use_fp16()
         jobs = []
+
+        candidates = []
         if has_cuda:
-            jobs.append((_UNIFIED_KEY, pt_variant.path, "cuda", imgsz, half))
-        jobs.append((_UNIFIED_KEY, pt_variant.path, "cpu", imgsz, half))
+            candidates.append(("cuda", imgsz, half))
+        candidates.append(("cpu", imgsz, half))
+
+        for device_key, _imgsz, _half in candidates:
+            fmt = _best_format(device_key)
+            if fmt == "pt":
+                continue  # no useful conversion available
+            out_path = self._expected_output_path(pt_variant.path, fmt)
+            if os.path.isfile(out_path) or os.path.isdir(out_path):
+                self._log(
+                    f"Skipping {device_key.upper()} optimisation — "
+                    f"{os.path.basename(out_path)} already exists"
+                )
+                continue
+            jobs.append((_UNIFIED_KEY, pt_variant.path, device_key, _imgsz, _half))
+
         return jobs
 
     def _on_convert_model(self, cid: int = _UNIFIED_KEY) -> None:
@@ -2524,8 +3085,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cvt_timer.stop()
             return
         elapsed = int(time.monotonic() - self._cvt_t0)
-        self._set_status(
-            f"{self._cvt_label}  ({elapsed}s elapsed — TRT builds take 3-5 min)")
+        # Update the status bar label in-place — do NOT call _log() here
+        # because that appends a new console line every 20 s, flooding the
+        # console during long TRT builds.
+        try:
+            self.statusLabel.setText(
+                f"{self._cvt_label}  ({elapsed}s elapsed — TRT builds take 5-20 min on first run)")
+        except Exception:
+            pass
 
     def _on_cvt_progress(self, cid: int, msg: str) -> None:
         self._cvt_label = msg   # keep heartbeat message in sync
@@ -2605,6 +3172,277 @@ class MainWindow(QtWidgets.QMainWindow):
         # Bottom bar is now reserved for live stats (FPS, motorcycle/rider
         # counts, etc.). Free-form status messages go to the Console panel.
         self._log(t)
+
+    # ── Settings / Credits / Exit popup ───────────────────────────────────
+
+    def _make_glass_dialog(self, title_text: str) -> "tuple[QtWidgets.QWidget, QtWidgets.QVBoxLayout, QtWidgets.QWidget]":
+        """Create a frameless glass-card overlay dialog.
+
+        Returns ``(overlay, card_layout, card_widget)``.  The overlay covers
+        the main window with a dark semi-transparent scrim; the card is
+        centred on top.  Caller should call ``overlay.show()`` / ``.hide()``
+        / ``.deleteLater()`` to manage lifetime.
+        """
+        # Full-window dark scrim anchored to the main window.
+        overlay = QtWidgets.QWidget(self)
+        overlay.setObjectName("glassOverlay")
+        overlay.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        overlay.setStyleSheet(
+            "#glassOverlay{background:rgba(0,0,0,0.60);}"
+        )
+        overlay.setGeometry(self.rect())
+        overlay.raise_()
+
+        # Card centred inside the scrim.
+        _mr = int(_R * _S * 2)
+        card = QtWidgets.QFrame(overlay)
+        card.setObjectName("glassCard")
+        card.setStyleSheet(
+            f"#glassCard{{background:#161616;"
+            f"border:1px solid {_BD};"
+            f"border-radius:{_mr}px;}}"
+        )
+
+        # Title row: centred title + ✕ icon button in top-right.
+        v = QtWidgets.QVBoxLayout(card)
+        _hp = int(20 * _S)
+        _vp = int(16 * _S)
+        v.setContentsMargins(_hp, _vp, _hp, _vp)
+        v.setSpacing(int(8 * _S))
+
+        hdr = QtWidgets.QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(0)
+        title_lbl = QtWidgets.QLabel(title_text)
+        title_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        title_lbl.setStyleSheet(
+            f"color:{_TH};font-weight:700;font-size:{int(14*_S)}px;"
+            "background:transparent;"
+        )
+        hdr.addStretch()
+        hdr.addWidget(title_lbl, 0, QtCore.Qt.AlignVCenter)
+        hdr.addStretch()
+        csz = int(11 * _S)
+        btn_x = self._ibtn("times", "Close", sz=csz)
+        btn_x.setFixedSize(int(22 * _S), int(22 * _S))
+        btn_x.clicked.connect(lambda: (overlay.deleteLater(),))
+        hdr.addWidget(btn_x, 0, QtCore.Qt.AlignVCenter)
+        v.addLayout(hdr)
+
+        return overlay, v, card
+
+    def _center_card(self, overlay: QtWidgets.QWidget, card: QtWidgets.QFrame) -> None:
+        overlay.setGeometry(self.rect())
+        card.adjustSize()
+        cw, ch = card.sizeHint().width(), card.sizeHint().height()
+        card.setGeometry(
+            (overlay.width() - cw) // 2,
+            (overlay.height() - ch) // 2,
+            cw, ch,
+        )
+
+    def _show_settings_menu(self) -> None:
+        """Centered glass-card menu overlay."""
+        overlay, v, card = self._make_glass_dialog("Menu")
+
+        _bh = int(36 * _S)
+        _bw = int(180 * _S)
+
+        def _menu_btn(icon: str, text: str) -> QtWidgets.QPushButton:
+            b = QtWidgets.QPushButton(text)
+            b.setIcon(_fa(icon, _T, int(13 * _S)))
+            b.setIconSize(QtCore.QSize(int(13 * _S), int(13 * _S)))
+            b.setFixedSize(_bw, _bh)
+            b.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            b.setFocusPolicy(QtCore.Qt.NoFocus)
+            b.setStyleSheet(
+                f"QPushButton{{background:{_BG};color:{_T};"
+                f"border:1px solid {_BD};border-radius:{int(_R*_S)}px;"
+                f"font-size:{int(10*_S)}px;text-align:left;"
+                f"padding-left:{int(14*_S)}px;}}"
+                f"QPushButton:hover{{background:#1a1a1a;border-color:{_TH};}}"
+                f"QPushButton:pressed{{background:#222;}}"
+            )
+            return b
+
+        v.addSpacing(int(4 * _S))
+        btn_settings = _menu_btn("sliders-h", "  Settings")
+        btn_credits = _menu_btn("info-circle", "  Credits")
+        btn_exit = _menu_btn("sign-out-alt", "  Exit")
+
+        for b in (btn_settings, btn_credits, btn_exit):
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addStretch()
+            row.addWidget(b)
+            row.addStretch()
+            v.addLayout(row)
+
+        def _close():
+            overlay.deleteLater()
+
+        btn_settings.clicked.connect(lambda: (_close(), self._show_settings_dialog()))
+        btn_credits.clicked.connect(lambda: (_close(), self._show_credits_dialog()))
+        btn_exit.clicked.connect(lambda: (_close(), self.close()))
+
+        overlay.show()
+        self._center_card(overlay, card)
+
+    def _show_settings_dialog(self) -> None:
+        overlay, v, card = self._make_glass_dialog("Settings")
+
+        _lbl_style = (
+            f"color:{_TD};font-size:{int(10*_S)}px;background:transparent;"
+            "margin:0;padding:0;"
+        )
+
+        # Display mode — single dropdown selector.
+        disp_lbl = QtWidgets.QLabel("Display mode")
+        disp_lbl.setStyleSheet(_lbl_style)
+        disp_combo = _AlignedComboBox()
+        disp_combo.addItem("Windowed", "windowed")
+        disp_combo.addItem("Fullscreen", "fullscreen")
+        disp_combo.setCurrentIndex(1 if self._is_fs else 0)
+        v.addWidget(disp_lbl)
+        v.addWidget(disp_combo)
+
+        # Window resolution (hidden in fullscreen mode).
+        res_lbl = QtWidgets.QLabel("Window resolution")
+        res_lbl.setStyleSheet(_lbl_style)
+        res_combo = _AlignedComboBox()
+        res_combo.addItem("1280 \u00d7 720", (1280, 720))
+        res_combo.addItem("1600 \u00d7 900", (1600, 900))
+        res_combo.addItem("1920 \u00d7 1080", (1920, 1080))
+        res_combo.addItem("2560 \u00d7 1440", (2560, 1440))
+        cur_w = self.width()
+        best_idx = min(range(res_combo.count()),
+                       key=lambda i: abs(res_combo.itemData(i)[0] - cur_w))
+        res_combo.setCurrentIndex(best_idx)
+        v.addWidget(res_lbl)
+        v.addWidget(res_combo)
+
+        def _sync_res():
+            is_win = disp_combo.currentData() == "windowed"
+            res_lbl.setEnabled(is_win)
+            res_combo.setEnabled(is_win)
+        disp_combo.currentIndexChanged.connect(lambda _: _sync_res())
+        _sync_res()
+
+        # UI scale
+        v.addSpacing(int(4 * _S))
+        scale_lbl = QtWidgets.QLabel("UI scale (requires restart)")
+        scale_lbl.setStyleSheet(_lbl_style)
+        scale_combo = _AlignedComboBox()
+        for s in (1.0, 1.25, 1.5, 1.75):
+            scale_combo.addItem(f"{s:g}\u00d7", s)
+        for i in range(scale_combo.count()):
+            if abs(float(scale_combo.itemData(i)) - _S) < 1e-3:
+                scale_combo.setCurrentIndex(i)
+                break
+        v.addWidget(scale_lbl)
+        v.addWidget(scale_combo)
+
+        # Reset buttons
+        v.addSpacing(int(6 * _S))
+        sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setStyleSheet(f"color:{_BD};background:{_BD};max-height:1px;")
+        v.addWidget(sep)
+        v.addSpacing(int(2 * _S))
+
+        def _small_btn(text: str) -> QtWidgets.QPushButton:
+            b = QtWidgets.QPushButton(text)
+            b.setFixedHeight(int(28 * _S))
+            b.setFocusPolicy(QtCore.Qt.NoFocus)
+            b.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            return b
+
+        btn_reset_layout = _small_btn("Reset layout")
+        btn_reset_settings = _small_btn("Reset detection settings")
+        v.addWidget(btn_reset_layout)
+        v.addWidget(btn_reset_settings)
+
+        def _reset_layout():
+            if self._sidebar_collapsed:
+                self._toggle_sidebar_collapsed()
+            if self._consolePanel.isVisible():
+                self._toggle_console()
+            self._splitter.setSizes(
+                [int(260 * _S), int(805 * _S), self._console_default_w])
+            self._set_status("Layout reset")
+        btn_reset_layout.clicked.connect(_reset_layout)
+
+        def _reset_settings():
+            self.confSlider.setValue(25)
+            self.iouSlider.setValue(30)
+            self.imgszCombo.setCurrentText("480")
+            self.deviceCombo.setCurrentIndex(0)
+            self.chkFp16.setChecked(False)
+            self.chkOverload.setChecked(True)
+            self.chkTracker.setChecked(True)
+            self.chkAdvancedThr.setChecked(False)
+            self.strideSlider.setValue(3)
+            self._set_status("Detection settings reset to defaults")
+        btn_reset_settings.clicked.connect(_reset_settings)
+
+        # Apply / close
+        v.addSpacing(int(4 * _S))
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_apply.setFixedHeight(int(32 * _S))
+        btn_apply.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        btn_apply.setFocusPolicy(QtCore.Qt.NoFocus)
+        btn_apply.setStyleSheet(
+            f"QPushButton{{background:{_TH};color:#0b0d12;"
+            f"border:none;border-radius:{int(_R*_S)}px;"
+            f"font-size:{int(11*_S)}px;font-weight:600;}}"
+            f"QPushButton:hover{{background:#e0e0e0;}}"
+            f"QPushButton:pressed{{background:#ccc;}}"
+        )
+        v.addWidget(btn_apply)
+
+        def _apply():
+            want_fs = disp_combo.currentData() == "fullscreen"
+            if want_fs and not self._is_fs:
+                self._toggle_fullscreen()
+            elif not want_fs and self._is_fs:
+                self._toggle_fullscreen()
+            if not self._is_fs:
+                w, h = res_combo.currentData()
+                self.resize(int(w), int(h))
+            new_scale = float(scale_combo.currentData())
+            if abs(new_scale - _S) > 1e-3:
+                QtWidgets.QMessageBox.information(
+                    self, "UI scale",
+                    f"UI scale set to {new_scale:g}\u00d7 \u2014 restart to apply.")
+            overlay.deleteLater()
+        btn_apply.clicked.connect(_apply)
+
+        overlay.show()
+        self._center_card(overlay, card)
+
+    def _show_credits_dialog(self) -> None:
+        overlay, v, card = self._make_glass_dialog("Credits")
+        v.addSpacing(int(8 * _S))
+        app_lbl = QtWidgets.QLabel("Safety Gear Compliance")
+        app_lbl.setStyleSheet(
+            f"color:{_TH};font-weight:700;font-size:{int(13*_S)}px;"
+            "background:transparent;")
+        app_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        v.addWidget(app_lbl)
+        sub = QtWidgets.QLabel("Developed by")
+        sub.setStyleSheet(
+            f"color:{_TD};font-size:{int(10*_S)}px;background:transparent;")
+        sub.setAlignment(QtCore.Qt.AlignCenter)
+        v.addWidget(sub)
+        names = QtWidgets.QLabel(
+            "Beneditto Alfonso A. Tiu\nAaron James A. Makinano")
+        names.setStyleSheet(
+            f"color:{_T};font-size:{int(11*_S)}px;font-weight:600;"
+            "background:transparent;")
+        names.setAlignment(QtCore.Qt.AlignCenter)
+        v.addWidget(names)
+        v.addSpacing(int(8 * _S))
+        overlay.show()
+        self._center_card(overlay, card)
 
     def dragEnterEvent(self, e):
         e.acceptProposedAction() if e.mimeData().hasUrls() else e.ignore()

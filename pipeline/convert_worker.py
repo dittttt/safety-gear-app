@@ -54,7 +54,7 @@ ConvertJob = Tuple[int, str, str, int, bool]
 class ConvertWorker(QtCore.QThread):
     """Run one or more model-conversion jobs in a background thread."""
 
-    ENGINE_TIMEOUT_SEC = 8 * 60
+    ENGINE_TIMEOUT_SEC = 20 * 60
     OPENVINO_TIMEOUT_SEC = 8 * 60
     ONNX_TIMEOUT_SEC = 6 * 60
 
@@ -255,7 +255,7 @@ class ConvertWorker(QtCore.QThread):
                 # ── 2) Export via Ultralytics ──────────────────────────────
                 msg = f"{tag} Exporting {basename} → {fmt.upper()} (imgsz={imgsz})"
                 if fmt == "engine":
-                    msg += " — TensorRT build takes 3-8 min, please wait…"
+                    msg += " — TensorRT build takes 5-20 min on first run, please wait…"
                 self.conversion_progress.emit(class_id, msg)
                 log.info(msg)
 

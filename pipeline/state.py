@@ -95,6 +95,20 @@ class PipelineState:
         self.class_colors_bgr: Dict[int, Tuple[int, int, int]] = dict(CLASS_COLORS_BGR)
         self.reset_tracker_flag: bool = False
 
+        # Per-class threshold overrides driven by the sidebar spinboxes.
+        # ``None`` ⇒ fall back to the config-driven default for that class.
+        self.per_class_conf_override: Dict[int, Optional[float]] = {
+            cid: None for cid in TARGET_CLASS_IDS
+        }
+        self.per_class_iou_override: Dict[int, Optional[float]] = {
+            cid: None for cid in TARGET_CLASS_IDS
+        }
+        # Bumped whenever any per-class override changes. The inference
+        # engine snapshots this and rebuilds its cached threshold maps
+        # only when the value differs — saves a per-frame dict-comp
+        # plus two lock acquisitions on the hot path.
+        self.per_class_override_version: int = 0
+
         # ── Model paths ──
         self.model_paths: Dict[int, Optional[str]] = {cid: None for cid in TARGET_CLASS_IDS}
 
@@ -174,6 +188,35 @@ class PipelineState:
         with self._lock:
             self.detection_config.iou = max(0.0, min(1.0, float(val)))
 
+    # ── Per-class threshold overrides ─────────────────────────────────────────
+    def get_per_class_conf_overrides(self) -> Dict[int, Optional[float]]:
+        with self._lock:
+            return dict(self.per_class_conf_override)
+
+    def set_per_class_conf_override(self, cid: int, val: Optional[float]) -> None:
+        with self._lock:
+            if val is None:
+                self.per_class_conf_override[cid] = None
+            else:
+                self.per_class_conf_override[cid] = max(0.0, min(1.0, float(val)))
+            self.per_class_override_version += 1
+
+    def get_per_class_iou_overrides(self) -> Dict[int, Optional[float]]:
+        with self._lock:
+            return dict(self.per_class_iou_override)
+
+    def set_per_class_iou_override(self, cid: int, val: Optional[float]) -> None:
+        with self._lock:
+            if val is None:
+                self.per_class_iou_override[cid] = None
+            else:
+                self.per_class_iou_override[cid] = max(0.0, min(1.0, float(val)))
+            self.per_class_override_version += 1
+
+    def get_per_class_override_version(self) -> int:
+        with self._lock:
+            return self.per_class_override_version
+
     def get_imgsz(self) -> int:
         with self._lock:
             return int(self.detection_config.imgsz)
@@ -206,6 +249,17 @@ class PipelineState:
     def set_use_fp16(self, enabled: bool) -> None:
         with self._lock:
             self.detection_config.use_fp16 = bool(enabled)
+
+    def is_tracker_enabled(self) -> bool:
+        with self._lock:
+            return bool(getattr(self.detection_config, "tracker_enabled", True))
+
+    def set_tracker_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self.detection_config.tracker_enabled = bool(enabled)
+            # Force a clean re-init of tracker state on the very next
+            # frame so we don't reuse stale tracks after toggling.
+            self.reset_tracker_flag = True
 
     def get_device(self) -> str:
         with self._lock:

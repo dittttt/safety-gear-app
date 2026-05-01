@@ -68,9 +68,9 @@ DISPLAY_QUEUE_SIZE = 2
 @dataclass
 class DetectionConfig:
     """Mutable detection settings shared across threads."""
-    conf: float = 0.25
+    conf: float = 0.20
     iou: float = 0.30
-    imgsz: int = 640
+    imgsz: int = 480
     inference_batch_size: int = 4
     inference_stride: int = 2
     use_fp16: bool = False
@@ -83,9 +83,45 @@ class DetectionConfig:
     # the rider as non-compliant.  Helps reject low-quality false positives.
     no_helmet_min_conf: float = 0.40
     tracker_key: str = "botsort"
+    # User toggle for the cross-frame tracker. When False, the inference
+    # engine falls back to plain ``model.predict`` (no IDs, but allows
+    # batching for higher FPS).
+    tracker_enabled: bool = True
+
+
+# ── Per-class confidence tuning ────────────────────────────────────────────────
+# The unified detector is a generalist and tends to be under-confident on
+# small / fine-grained classes (footwear, improper_footwear, helmets at
+# distance). We therefore POST-FILTER detections per class instead of
+# raising the global slider, which would suppress good far-range hits.
+#
+# Pipeline:
+#   1. Run inference at ``conf = min(global_conf, min(_CLASS_CONF_MIN.values()))``
+#      so the model returns everything that *could* be relevant.
+#   2. After extraction, drop any detection whose score is below
+#      ``max(_CLASS_CONF_MIN[cid], global_conf * _CLASS_CONF_FACTOR[cid])``.
+#
+# Tune these knobs per-class without touching the inference loop.
+CLASS_CONF_FACTOR: Dict[int, float] = {
+    CLASS_MOTORCYCLE:        1.00,
+    CLASS_RIDER:             1.00,
+    CLASS_HELMET:            0.80,   # helmets get small at distance
+    CLASS_NO_HELMET:         1.20,   # bias against false positives
+    CLASS_FOOTWEAR:          0.70,
+    CLASS_IMPROPER_FOOTWEAR: 0.60,   # the big recall lever
+}
+CLASS_CONF_MIN: Dict[int, float] = {
+    CLASS_MOTORCYCLE:        0.20,
+    CLASS_RIDER:             0.20,
+    CLASS_HELMET:            0.15,
+    CLASS_NO_HELMET:         0.30,
+    CLASS_FOOTWEAR:          0.12,
+    CLASS_IMPROPER_FOOTWEAR: 0.10,
+}
 
 # ── Supported file extensions ──────────────────────────────────────────────────
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".m4v"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MODEL_EXTENSIONS = {".pt", ".engine", ".onnx"}
 
 # ── Default model file names ─────────────────────────────────────────────────

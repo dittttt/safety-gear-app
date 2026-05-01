@@ -46,7 +46,8 @@ _SUPABASE_URL: str = ""
 _SUPABASE_KEY: str = ""
 _TABLE: str = "compliance_logs"
 _HAS_CREDENTIALS: bool = False
-_USER_ENABLED: bool = True
+# Default OFF — DB logging is opt-in via the sidebar checkbox.
+_USER_ENABLED: bool = False
 
 DEDUP_WINDOW_S: float = 8.0
 """Suppress repeat events for the same (moto_id, type) inside this window."""

@@ -24,13 +24,36 @@ from ultralytics import YOLO
 from ultralytics.utils import LOGGER as ULTRA_LOGGER
 import torch
 
-from config import TARGET_CLASS_IDS, CLASS_NAMES
+from config import (
+    TARGET_CLASS_IDS,
+    CLASS_NAMES,
+    CLASS_MOTORCYCLE,
+    CLASS_RIDER,
+    CLASS_CONF_FACTOR,
+    CLASS_CONF_MIN,
+)
 from pipeline.state import PipelineState, Detection, DetectionPacket
 from utils.runtime_check import detect as detect_runtime
 
 
-# The unified detector is well-calibrated across all 7 classes; per-class
-# confidence overrides are no longer required.
+def _per_class_threshold(cid: int, base_conf: float) -> float:
+    """Effective confidence floor for *cid* given the global slider value."""
+    factor = CLASS_CONF_FACTOR.get(cid, 1.0)
+    floor = CLASS_CONF_MIN.get(cid, 0.0)
+    return float(max(floor, base_conf * factor))
+
+
+def _floor_inference_conf(base_conf: float) -> float:
+    """Lowest threshold the model must run at so post-filtering still works.
+
+    The model itself filters by the ``conf`` argument BEFORE returning
+    boxes, so we have to call it with the minimum across every class
+    we still want to recover (otherwise low-conf improper-footwear hits
+    are lost for good).
+    """
+    if not CLASS_CONF_MIN:
+        return base_conf
+    return float(min(min(CLASS_CONF_MIN.values()), base_conf))
 
 
 @contextlib.contextmanager
@@ -278,6 +301,13 @@ class InferenceThread(QtCore.QThread):
             "iou": iou,
             "imgsz": imgsz,
             "verbose": False,
+            # Drop the filler ``tricycle`` class (cid 6) at the Ultralytics
+            # layer so it never reaches NMS, the result objects, or — most
+            # importantly — the BoT-SORT tracker. Otherwise tricycle boxes
+            # consume tracker IDs and a vehicle whose class flickers between
+            # motorcycle and tricycle across frames gets two parallel tracks
+            # instead of one stable motorcycle track.
+            "classes": list(TARGET_CLASS_IDS),
         }
         if path.endswith(".pt"):
             kwargs["device"] = self._device
@@ -304,21 +334,15 @@ class InferenceThread(QtCore.QThread):
     def _predict_unified(self, frames: List[np.ndarray], kwargs: dict):
         """Run the unified model once on a list of frames.
 
-        When tracking is enabled (the default), uses ``model.track()`` so the
-        configured BoT-SORT/ByteTrack instance assigns stable IDs across
-        frames. Tracking is inherently stateful → frames must be processed
-        one-at-a-time even if predict() would happily batch them.
+        Plain ``predict()`` is the authoritative source for boxes.  BoT-SORT
+        can suppress tiny classes like footwear, so tracking is handled in a
+        separate pass and only used to copy IDs onto motorcycles/riders.
         """
         model = self._models.get(self.UNIFIED_KEY)
         if model is None:
             return [None] * len(frames)
         path = self._model_paths.get(self.UNIFIED_KEY, "")
 
-        tracker_cfg = self._resolve_tracker_config()
-        if tracker_cfg:
-            return self._track_frames(model, frames, kwargs, tracker_cfg)
-
-        # Tracking disabled → fall back to plain prediction (no IDs).
         allow_batch = not self._is_openvino_path(path)
         if allow_batch:
             try:
@@ -339,6 +363,8 @@ class InferenceThread(QtCore.QThread):
     def _resolve_tracker_config(self) -> Optional[str]:
         """Return an absolute path to the active tracker YAML, if any."""
         cfg = self._state.detection_config
+        if not getattr(cfg, "tracker_enabled", True):
+            return None
         key = (getattr(cfg, "tracker_key", None) or "").strip().lower()
         if not key or key in {"none", "off", "disabled"}:
             return None
@@ -361,6 +387,9 @@ class InferenceThread(QtCore.QThread):
         track_kwargs = dict(kwargs)
         track_kwargs.pop("half", None)
         track_kwargs["tracker"] = tracker_cfg
+        # Track only the objects that need stable IDs. Gear classes are tiny
+        # and tracker filtering can suppress them, so they stay predict-only.
+        track_kwargs["classes"] = [CLASS_MOTORCYCLE, CLASS_RIDER]
 
         out: List = []
         for frame in frames:
@@ -386,14 +415,73 @@ class InferenceThread(QtCore.QThread):
                     out.append(None)
         return out
 
+    @staticmethod
+    def _bbox_iou(a: Detection, b: Detection) -> float:
+        ix1 = max(a.x1, b.x1)
+        iy1 = max(a.y1, b.y1)
+        ix2 = min(a.x2, b.x2)
+        iy2 = min(a.y2, b.y2)
+        iw = max(0, ix2 - ix1)
+        ih = max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(0, a.x2 - a.x1) * max(0, a.y2 - a.y1)
+        area_b = max(0, b.x2 - b.x1) * max(0, b.y2 - b.y1)
+        union = area_a + area_b - inter
+        return inter / float(union) if union > 0 else 0.0
+
+    @classmethod
+    def _copy_vehicle_rider_track_ids(
+        cls,
+        detections: List[Detection],
+        tracked: List[Detection],
+        min_iou: float = 0.50,
+    ) -> None:
+        """Copy tracker IDs onto predict() detections for motorcycle/rider.
+
+        The full predict() list keeps all gear boxes.  The tracker pass is
+        only used as metadata for large objects where stable IDs matter.
+        """
+        if not detections or not tracked:
+            return
+        tracked_with_ids = [
+            d for d in tracked
+            if d.track_id is not None and d.class_id in (CLASS_MOTORCYCLE, CLASS_RIDER)
+        ]
+        if not tracked_with_ids:
+            return
+        for det in detections:
+            if det.class_id not in (CLASS_MOTORCYCLE, CLASS_RIDER):
+                continue
+            best = None
+            best_iou = 0.0
+            for trk in tracked_with_ids:
+                if trk.class_id != det.class_id:
+                    continue
+                score = cls._bbox_iou(det, trk)
+                if score > best_iou:
+                    best = trk
+                    best_iou = score
+            if best is not None and best_iou >= min_iou:
+                det.track_id = best.track_id
+
     # ── Detection extraction helpers ───────────────────────────────────────────
 
     @staticmethod
-    def _extract_detections(result, allowed_classes: Optional[set] = None) -> List[Detection]:
+    def _extract_detections(
+        result,
+        allowed_classes: Optional[set] = None,
+        per_class_min: Optional[Dict[int, float]] = None,
+    ) -> List[Detection]:
         """Convert one Ultralytics result into a list of typed Detections.
 
         ``allowed_classes`` filters by class id (after extraction); pass
         ``None`` to keep every class the model emitted.
+
+        ``per_class_min`` is a ``{cid: min_conf}`` map applied AFTER the
+        model returns. Used to recover small-object recall by running the
+        model at a low conf and tightening per-class thresholds in Python.
         """
         boxes = getattr(result, "boxes", None)
         if boxes is None:
@@ -424,11 +512,64 @@ class InferenceThread(QtCore.QThread):
             cid = int(cls_np[i])
             if allowed_classes is not None and cid not in allowed_classes:
                 continue
-            x1, y1, x2, y2 = (int(v) for v in xyxy_np[i])
             score = float(conf_np[i]) if conf_np is not None else 0.0
+            if per_class_min is not None:
+                thresh = per_class_min.get(cid)
+                if thresh is not None and score < thresh:
+                    continue
+            x1, y1, x2, y2 = (int(v) for v in xyxy_np[i])
             tid = int(id_np[i]) if (id_np is not None and i < len(id_np)) else None
             dets.append(Detection(x1, y1, x2, y2, cid, score, tid))
         return dets
+
+    @staticmethod
+    def _apply_per_class_nms(
+        dets: List[Detection],
+        iou_overrides: Dict[int, Optional[float]],
+    ) -> List[Detection]:
+        """Apply a tighter per-class NMS pass when the user has set an
+        IoU spinbox for a given class. Detections for classes without an
+        override pass through untouched.
+
+        Greedy NumPy NMS — fast enough for the small detection counts
+        produced after the model's own NMS already ran.
+        """
+        if not dets or not iou_overrides:
+            return dets
+        # Bucket by class so we only NMS within each class.
+        buckets: Dict[int, List[Detection]] = {}
+        for d in dets:
+            buckets.setdefault(d.class_id, []).append(d)
+        kept: List[Detection] = []
+        for cid, group in buckets.items():
+            thresh = iou_overrides.get(cid)
+            if thresh is None or len(group) < 2:
+                kept.extend(group)
+                continue
+            # Sort by descending score, greedily keep boxes whose IoU
+            # against any already-kept box is below the threshold.
+            group_sorted = sorted(
+                group, key=lambda d: d.confidence, reverse=True)
+            survivors: List[Detection] = []
+            for cand in group_sorted:
+                drop = False
+                for s in survivors:
+                    ix1 = max(cand.x1, s.x1); iy1 = max(cand.y1, s.y1)
+                    ix2 = min(cand.x2, s.x2); iy2 = min(cand.y2, s.y2)
+                    iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
+                    inter = iw * ih
+                    if inter <= 0:
+                        continue
+                    a1 = max(0, cand.x2 - cand.x1) * max(0, cand.y2 - cand.y1)
+                    a2 = max(0, s.x2 - s.x1) * max(0, s.y2 - s.y1)
+                    union = a1 + a2 - inter
+                    if union > 0 and (inter / union) >= thresh:
+                        drop = True
+                        break
+                if not drop:
+                    survivors.append(cand)
+            kept.extend(survivors)
+        return kept
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
@@ -443,6 +584,17 @@ class InferenceThread(QtCore.QThread):
         t0 = time.perf_counter()
         step = 0
         cached_dets: List[Detection] = []
+        # Cached per-class threshold maps. Rebuilt only when the user
+        # touches a sidebar spinbox (tracked via state.per_class_override_version)
+        # or when the global conf slider changes — saves ~2 lock acquisitions
+        # and a dict-comp on every inference frame.
+        cached_pc_version: int = -1
+        cached_pc_conf: float = -1.0
+        cached_per_class_min: Dict[int, float] = {}
+        cached_iou_overrides: Dict[int, Optional[float]] = {}
+        # True when at least one IoU override is tighter than the global
+        # IoU we passed to Ultralytics (i.e. it can actually drop a box).
+        cached_iou_nms_useful: bool = False
 
         while not state.stop_event.is_set():
             # Hot-reload models if flagged (e.g. after optimised conversion)
@@ -474,6 +626,13 @@ class InferenceThread(QtCore.QThread):
             stride = state.get_inference_stride()
             overlay = state.is_overlay_enabled()
 
+            # Tracking is stateful: BoT-SORT must see EVERY frame to keep
+            # IDs stable. If the user enabled the tracker, ignore stride and
+            # infer per-frame — otherwise feeding the tracker every Nth frame
+            # makes IDs flip whenever something moves quickly.
+            if stride > 1 and self._resolve_tracker_config():
+                stride = 1
+
             infer_idxs = [
                 i for i in range(len(packets))
                 if (stride <= 1 or ((step + i) % stride == 0))
@@ -484,22 +643,80 @@ class InferenceThread(QtCore.QThread):
             if overlay and self._models and infer_idxs:
                 infer_frames = [packets[i].frame for i in infer_idxs]
 
-                # ONE forward pass through the unified detector.  Each result
-                # is then split into per-class buckets according to the user's
-                # enabled-models settings (so toggles in the GUI still gate
-                # classes; we just don't run the model multiple times).
-                kwargs = self._predict_kwargs(conf, iou, imgsz)
+                # ONE forward pass through the unified detector.  We call
+                # the model with the LOWEST per-class threshold so we can
+                # tighten each class in Python afterwards (recovers small
+                # / underconfident classes like improper_footwear without
+                # blanket-lowering the global slider).
+                model_conf = _floor_inference_conf(conf)
+                kwargs = self._predict_kwargs(model_conf, iou, imgsz)
                 results = self._predict_unified(infer_frames, kwargs)
+                tracker_cfg = self._resolve_tracker_config()
+                tracked_results = (
+                    self._track_frames(
+                        self._models[self.UNIFIED_KEY],
+                        infer_frames,
+                        kwargs,
+                        tracker_cfg,
+                    )
+                    if tracker_cfg and self.UNIFIED_KEY in self._models
+                    else []
+                )
 
                 allowed = {
                     cid for cid in TARGET_CLASS_IDS
                     if state.is_model_enabled(cid)
                 }
+                # Per-class min conf + IoU overrides: snapshot only when
+                # the user has actually changed something (version bump)
+                # or when the global conf slider has moved. Otherwise
+                # reuse the cached maps — the dict-comp + 2 lock
+                # acquisitions used to run on every single frame.
+                pc_version = state.get_per_class_override_version()
+                if pc_version != cached_pc_version or conf != cached_pc_conf:
+                    conf_overrides = state.get_per_class_conf_overrides()
+                    iou_overrides_snap = state.get_per_class_iou_overrides()
+                    cached_per_class_min = {
+                        cid: (
+                            conf_overrides[cid]
+                            if conf_overrides.get(cid) is not None
+                            else _per_class_threshold(cid, conf)
+                        )
+                        for cid in TARGET_CLASS_IDS
+                    }
+                    cached_iou_overrides = iou_overrides_snap
+                    # The post-extraction NMS pass only matters when an
+                    # override is tighter than the IoU Ultralytics already
+                    # applied — anything looser cannot drop more boxes.
+                    cached_iou_nms_useful = any(
+                        v is not None and v < iou
+                        for v in iou_overrides_snap.values()
+                    )
+                    cached_pc_version = pc_version
+                    cached_pc_conf = conf
+
+                per_class_min = cached_per_class_min
+                run_iou_nms = cached_iou_nms_useful
+                iou_overrides = cached_iou_overrides
                 for local_i, result in enumerate(results):
                     if local_i >= len(infer_idxs) or result is None:
                         continue
                     pkt_i = infer_idxs[local_i]
-                    extracted = self._extract_detections(result, allowed_classes=allowed)
+                    extracted = self._extract_detections(
+                        result,
+                        allowed_classes=allowed,
+                        per_class_min=per_class_min,
+                    )
+                    if local_i < len(tracked_results) and tracked_results[local_i] is not None:
+                        tracked = self._extract_detections(
+                            tracked_results[local_i],
+                            allowed_classes={CLASS_MOTORCYCLE, CLASS_RIDER},
+                            per_class_min=None,
+                        )
+                        self._copy_vehicle_rider_track_ids(extracted, tracked)
+                    if run_iou_nms:
+                        extracted = self._apply_per_class_nms(
+                            extracted, iou_overrides)
                     dets_by_idx[pkt_i].extend(extracted)
 
             for i, packet in enumerate(packets):

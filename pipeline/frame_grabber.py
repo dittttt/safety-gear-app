@@ -6,14 +6,63 @@ frame queue.  Handles playback pacing, pause / resume, and seek requests.
 """
 
 import os
+import sys
 import time
+import contextlib
 from typing import Optional
 
 import cv2
 from PyQt5 import QtCore
 
+from config import IMAGE_EXTENSIONS
 from pipeline.state import PipelineState, FramePacket
 from utils.camera_devices import open_camera_capture
+
+
+@contextlib.contextmanager
+def _silence_fd2():
+    """Redirect OS-level stderr (fd 2) to NUL.
+
+    Used to swallow libavcodec's ``[h264 @ 0x...] reference picture missing``
+    spam that follows every random-access seek.  Those messages bypass
+    Python's ``sys.stderr`` because they come from FFmpeg's C-side
+    ``av_log()`` writing directly to fd 2, so the only reliable way to
+    silence them cross-platform is at the file-descriptor level.
+    """
+    devnull = "NUL" if sys.platform == "win32" else "/dev/null"
+    old_fd = None
+    devnull_fd = None
+    try:
+        sys.stderr.flush()
+        devnull_fd = os.open(devnull, os.O_WRONLY)
+        old_fd = os.dup(2)
+        os.dup2(devnull_fd, 2)
+        yield
+    except OSError:
+        # If the dup trick fails (restricted env), just don't silence.
+        yield
+    finally:
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if old_fd is not None:
+            try:
+                os.dup2(old_fd, 2)
+                os.close(old_fd)
+            except OSError:
+                pass
+        if devnull_fd is not None:
+            try:
+                os.close(devnull_fd)
+            except OSError:
+                pass
+
+
+def _read_quiet(cap):
+    """``cap.read()`` with fd-2 silenced — for use inside the post-seek window."""
+    with _silence_fd2():
+        return cap.read()
 
 
 class FrameGrabberThread(QtCore.QThread):
@@ -34,6 +83,10 @@ class FrameGrabberThread(QtCore.QThread):
         state = self._state
         path, camera_source = state.get_source()
         is_live_camera = camera_source is not None
+        is_image_source = (
+            bool(path)
+            and os.path.splitext(str(path))[1].lower() in IMAGE_EXTENSIONS
+        )
 
         if not is_live_camera and not path:
             self.error.emit("No source selected")
@@ -43,6 +96,31 @@ class FrameGrabberThread(QtCore.QThread):
         # Using "-8" (quiet) silences the H.264 "reference picture missing"
         # spam that appears after every seek to a non-keyframe.
         os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
+        if is_image_source:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is None:
+                self.error.emit(f"Cannot open: {path}")
+                return
+            state.video_fps = 1.0
+            state.total_frames = 1
+            self.metaReady.emit(1.0, 1)
+            emitted = False
+            while not state.stop_event.is_set():
+                if state.consume_seek() is not None:
+                    state.flush_queues()
+                    state.reset_tracker_flag = True
+                    emitted = False
+                if state.pause_event.is_set():
+                    self.msleep(30)
+                    continue
+                if not emitted:
+                    packet = FramePacket(index=0, frame=frame.copy(), timestamp_ms=0.0)
+                    state.put_safe(state.frame_queue, packet)
+                    self.positionChanged.emit(0, 0.0)
+                    emitted = True
+                self.msleep(50)
+            return
 
         if is_live_camera:
             cap = open_camera_capture(camera_source)
@@ -74,6 +152,12 @@ class FrameGrabberThread(QtCore.QThread):
 
         frame_idx = 0
         next_frame_time = time.perf_counter()
+        # FFmpeg / libavcodec spams ``[h264] reference picture missing during
+        # reorder`` for ~1 GOP after every random-access seek.  We open a
+        # short fd-2 silencer window after each seek and only swallow stderr
+        # during that window — legitimate errors outside it still surface.
+        quiet_until: float = 0.0
+        SEEK_QUIET_SECONDS: float = 1.5
 
         while not state.stop_event.is_set():
             # ── Handle seek (file sources only) ───────────────────────────
@@ -101,14 +185,17 @@ class FrameGrabberThread(QtCore.QThread):
                     # which avoids the manual warmup loop (much faster) and
                     # the "reference picture missing" decoder errors caused
                     # by feeding the decoder an arbitrary mid-GOP start.
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, float(target))
+                    with _silence_fd2():
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, float(target))
                     frame_idx = target
                     state.reset_tracker_flag = True
                     next_frame_time = time.perf_counter()
+                    quiet_until = time.perf_counter() + SEEK_QUIET_SECONDS
 
                     # Decode and publish one frame immediately so the UI
                     # updates instantly in both paused and playing states.
-                    ok, frame = cap.read()
+                    with _silence_fd2():
+                        ok, frame = cap.read()
                     if ok and frame is not None:
                         ts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                         packet = FramePacket(index=frame_idx, frame=frame, timestamp_ms=ts_ms)
@@ -130,7 +217,11 @@ class FrameGrabberThread(QtCore.QThread):
                 self.msleep(30)
                 continue
 
-            ok, frame = cap.read()
+            ok, frame = (
+                _read_quiet(cap)
+                if (not is_live_camera and time.perf_counter() < quiet_until)
+                else cap.read()
+            )
             if not ok:
                 if is_live_camera:
                     # A transient camera read failure should not kill the
@@ -181,11 +272,14 @@ class FrameGrabberThread(QtCore.QThread):
             # Frame-skipping for high playback rates (>=2×)
             if not is_live_camera and rate >= 2.0:
                 skip = int(rate) - 1
-                for _ in range(skip):
-                    if state.stop_event.is_set() or state.pause_event.is_set():
-                        break
-                    if not cap.grab():
-                        break
-                    frame_idx += 1
+                quiet = time.perf_counter() < quiet_until
+                ctx = _silence_fd2() if quiet else contextlib.nullcontext()
+                with ctx:
+                    for _ in range(skip):
+                        if state.stop_event.is_set() or state.pause_event.is_set():
+                            break
+                        if not cap.grab():
+                            break
+                        frame_idx += 1
 
         cap.release()
