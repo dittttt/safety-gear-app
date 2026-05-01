@@ -169,3 +169,10 @@ stdout-json={"ok": false, "error": "No module named 'tensorrt'", "tb": "Tracebac
 10:03:16 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
 10:03:16 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
 10:03:30 INFO Export OK in 13.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best_openvino_model
+03:59:20 INFO ConvertWorker starting — 2 job(s)
+03:59:20 INFO [1/2] Job start: cid=-1  file=best.pt  device=cuda  fmt=engine
+03:59:20 INFO [1/2] Exporting best → ENGINE (imgsz=640) — TensorRT build takes 5-20 min on first run, please wait…
+04:10:16 INFO Export OK in 656.8s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best.engine
+04:10:16 INFO [2/2] Job start: cid=-1  file=best.pt  device=cpu  fmt=openvino
+04:10:16 INFO [2/2] Exporting best → OPENVINO (imgsz=640)
+04:10:30 INFO Export OK in 13.6s → C:\Users\ditto\Desktop\CODES\safety-gear-app\models\unified\best_openvino_model
