@@ -49,7 +49,6 @@ _SUPABASE_ANON_KEY = (
 _VIOLATION_LABELS = {
     "no_helmet": "NO HELMET",
     "improper_footwear": "BAD FOOTWEAR",
-    "overload": "OVERLOAD",
 }
 
 # Sentinel key used by the model-picker dictionaries.  The system uses a
@@ -80,7 +79,6 @@ _STAT_ITEMS = (
     ("helmet_unknown", "Helmet ?"),
     ("footwear_unknown", "Footwear ?"),
     ("improper_footwear", "Bad Footwear"),
-    ("overloaded_motos", "Overload"),
     ("invalid_detections", "Occluded"),
 )
 _CLASS_INFER_RULES = (
@@ -1222,7 +1220,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Toggle group: visually separated from sliders / combos by a
         # small spacer above and below so the boolean options read as a
-        # distinct block. Order: FP16 → Overload → Tracker → DB Logging.
+        # distinct block. Order: FP16 → Tracker → DB Logging.
         dl.addSpacing(int(6 * _S))
 
         self.chkFp16 = QtWidgets.QCheckBox("Use FP16 instead of FP32")
@@ -1230,12 +1228,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chkFp16.setChecked(False)
         self.chkFp16.setFocusPolicy(QtCore.Qt.NoFocus)
         dl.addWidget(self.chkFp16)
-
-        self.chkOverload = QtWidgets.QCheckBox("Highlight Overloading (>2 riders)")
-        self.chkOverload.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.chkOverload.setChecked(True)
-        self.chkOverload.setFocusPolicy(QtCore.Qt.NoFocus)
-        dl.addWidget(self.chkOverload)
 
         self.chkTracker = QtWidgets.QCheckBox("Tracker (BoT-SORT)")
         self.chkTracker.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
@@ -1530,13 +1522,11 @@ class MainWindow(QtWidgets.QMainWindow):
         """Tracker → console + Supabase logger.
 
         Only NON-COMPLIANT events are routed (helmet missing / improper
-        footwear / overload).  Throttling lives in supabase_logger.submit().
+        footwear).  Throttling lives in supabase_logger.submit().
         """
         vtype = str(payload.get("violation_type", "")).strip()
         if not vtype:
             return
-        # Skip overload events for Supabase logging — user only asked for
-        # footwear / helmet violations to be uploaded.
         log_to_db = vtype in ("no_helmet", "improper_footwear")
 
         # Always log to the in-app console
@@ -2088,7 +2078,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.imgszCombo.currentIndexChanged.connect(self._on_imgsz_changed)
         self.deviceCombo.currentIndexChanged.connect(self._on_device_changed)
         self.chkFp16.toggled.connect(self._on_fp16_toggled)
-        self.chkOverload.toggled.connect(self._on_overload_toggled)
         self.chkDbLogging.toggled.connect(self._on_db_logging_toggled)
         self.chkTracker.toggled.connect(self._on_tracker_toggled)
         self.strideSlider.valueChanged.connect(self._on_stride_changed)
@@ -2747,8 +2736,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """One-line summary of the active inference configuration.
 
         Always rendered in the bottom status bar so the user can see at a
-        glance which engine / device / precision / stride / tracker /
-        overload settings are in effect. Updated live whenever a sidebar
+        glance which engine / device / precision / stride / tracker
+        settings are in effect. Updated live whenever a sidebar
         control changes (see `_refresh_status_bar`).
         """
         backend = self._current_backend_label()
@@ -2765,11 +2754,9 @@ class MainWindow(QtWidgets.QMainWindow):
         imgsz = self._state.get_imgsz()
         stride = self._state.get_inference_stride()
         tracker = "Tracker" if self._state.is_tracker_enabled() else "NoTrack"
-        overload_on = self._state.get_max_riders_per_motorcycle() <= 2
-        overload = "Overload\u2713" if overload_on else "Overload\u2717"
         return (
             f"{backend}/{device}/{precision} \u00b7 imgsz {imgsz} \u00b7 "
-            f"stride {stride}\u00d7 \u00b7 {tracker} \u00b7 {overload}"
+            f"stride {stride}\u00d7 \u00b7 {tracker}"
         )
 
     def _refresh_status_bar(self) -> None:
@@ -2861,16 +2848,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if enabled else "FP32 (FP16 disabled)"
         )
         self._restart_pipeline_if_running(msg)
-        self._refresh_status_bar()
-
-    def _on_overload_toggled(self, enabled: bool) -> None:
-        # Enabled = enforce 2-rider limit (any extra rider = overload).
-        # Disabled = effectively never overload.
-        self._state.set_max_riders_per_motorcycle(2 if enabled else 999)
-        self._set_status(
-            "Overload highlighting on (>2 riders)"
-            if enabled else "Overload highlighting off"
-        )
         self._refresh_status_bar()
 
     def _on_tracker_toggled(self, enabled: bool) -> None:
@@ -3377,7 +3354,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.imgszCombo.setCurrentText("480")
             self.deviceCombo.setCurrentIndex(0)
             self.chkFp16.setChecked(False)
-            self.chkOverload.setChecked(True)
             self.chkTracker.setChecked(True)
             self.chkAdvancedThr.setChecked(False)
             self.strideSlider.setValue(3)

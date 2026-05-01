@@ -57,7 +57,6 @@ CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
 # Compliance overlay colours
 COLOR_COMPLIANT_BGR: Tuple[int, int, int] = (0, 220, 0)       # Green
 COLOR_NON_COMPLIANT_BGR: Tuple[int, int, int] = (0, 0, 255)   # Red
-COLOR_OVERLOAD_BGR: Tuple[int, int, int] = (0, 140, 255)      # Orange
 
 # ── Pipeline queue capacities ──────────────────────────────────────────────────
 FRAME_QUEUE_SIZE = 4
@@ -78,7 +77,6 @@ class DetectionConfig:
     rider_moto_ioa_thresh: float = 0.05
     gear_rider_ioa_thresh: float = 0.10
     occlusion_conf_thresh: float = 0.10
-    max_riders_per_motorcycle: int = 2
     # Minimum confidence required on a `no_helmet` detection before flagging
     # the rider as non-compliant.  Helps reject low-quality false positives.
     no_helmet_min_conf: float = 0.40

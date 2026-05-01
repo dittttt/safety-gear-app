@@ -2,7 +2,7 @@
 Supabase compliance logger
 ==========================
 
-Sends non-compliance events (no-helmet, improper-footwear, overload) to a
+Sends non-compliance events (no-helmet, improper-footwear) to a
 Supabase REST endpoint in the background.  Designed to never block the
 inference / tracker / GUI threads:
 
