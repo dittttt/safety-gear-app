@@ -1,6 +1,6 @@
-# Ultralytics tracker config - BoT-SORT
-# Goal: keep camera motion compensation (global motion compensation) active.
-# Note: Ultralytics uses GMC (Global Motion Compensation) for camera motion.
+# Ultralytics tracker config - BoT-SORT + ReID
+# Goal: keep camera motion compensation active while using native detector
+# features for appearance matching when the active model is a PyTorch .pt.
 
 tracker_type: botsort
 
@@ -10,21 +10,19 @@ new_track_thresh: 0.6
 track_buffer: 30
 match_thresh: 0.8
 
-# Required by Ultralytics BOTSORT implementation
+# ReID matching gates.
 proximity_thresh: 0.5
-appearance_thresh: 0.25
+appearance_thresh: 0.8
 
-# Disable ReID explicitly — we do not ship a ReID model with the app.
-# Newer Ultralytics versions warn (or error) if appearance_thresh is set
-# without with_reid, which used to silently fall the inference engine
-# back to plain predict() (losing track IDs for the rest of the video).
-with_reid: false
+# model: auto lets Ultralytics reuse native YOLO detector features, avoiding
+# a separate ReID model file for the normal .pt runtime. Exported backends
+# use trackers/botsort_motion.yaml from the inference engine because their
+# native feature maps are not available through the same PyTorch hook.
+with_reid: true
+model: auto
 
 fuse_score: true
 
 # Camera Motion Compensation / Global Motion Compensation
 # Common options in Ultralytics: sparseOptFlow, orb, ecc, none
 gmc_method: sparseOptFlow
-
-# ReID is typically disabled in Ultralytics' BoT-SORT implementation
-with_reid: false

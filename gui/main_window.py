@@ -1229,12 +1229,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chkFp16.setFocusPolicy(QtCore.Qt.NoFocus)
         dl.addWidget(self.chkFp16)
 
-        self.chkTracker = QtWidgets.QCheckBox("Tracker (BoT-SORT)")
+        self.chkTracker = QtWidgets.QCheckBox("Tracker (BoT-SORT + ReID)")
         self.chkTracker.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.chkTracker.setChecked(self._state.is_tracker_enabled())
         self.chkTracker.setFocusPolicy(QtCore.Qt.NoFocus)
         self.chkTracker.setToolTip(
             "Enable cross-frame tracking for stable IDs and smoother boxes.\n"
+            "ReID is used with PyTorch .pt models; accelerated exports use\n"
+            "motion-only BoT-SORT fallback.\n"
             "Disabling switches back to per-frame predict() which is faster\n"
             "but flickers and has no rider IDs."
         )
@@ -2853,7 +2855,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tracker_toggled(self, enabled: bool) -> None:
         self._state.set_tracker_enabled(bool(enabled))
         self._set_status(
-            "Tracker enabled (BoT-SORT) — stable IDs, smoother boxes"
+            "Tracker enabled (BoT-SORT + ReID when available) — stable IDs, smoother boxes"
             if enabled else
             "Tracker disabled — per-frame predict (faster, no IDs, may flicker)"
         )

@@ -370,6 +370,16 @@ class InferenceThread(QtCore.QThread):
             return None
         # trackers/ lives at the repo root next to main.py.
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if key == "botsort":
+            current_model = str(self._model_paths.get(self.UNIFIED_KEY, "")).lower()
+            # ReID with model:auto relies on PyTorch feature hooks. TensorRT
+            # and OpenVINO do not expose those native detector features, so
+            # use the motion-only BoT-SORT fallback instead of letting
+            # Ultralytics try to pull an external classifier model at runtime.
+            if current_model and not current_model.endswith(".pt"):
+                fallback = os.path.join(repo_root, "trackers", "botsort_motion.yaml")
+                if os.path.isfile(fallback):
+                    return fallback
         path = os.path.join(repo_root, "trackers", f"{key}.yaml")
         return path if os.path.isfile(path) else None
 
@@ -389,6 +399,8 @@ class InferenceThread(QtCore.QThread):
         track_kwargs["tracker"] = tracker_cfg
         # Track only the objects that need stable IDs. Gear classes are tiny
         # and tracker filtering can suppress them, so they stay predict-only.
+        # When botsort.yaml is active, BoT-SORT also uses ReID appearance
+        # features for these large-object tracks.
         track_kwargs["classes"] = [CLASS_MOTORCYCLE, CLASS_RIDER]
 
         out: List = []
